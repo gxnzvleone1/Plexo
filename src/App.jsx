@@ -4,7 +4,7 @@ import {
   Plus, X, Check, ChevronDown, ChevronRight, ChevronLeft, ChevronUp,
   Edit2, Trash2, Search, Copy, MoreVertical, Settings, Download, Upload,
   TrendingUp, ListChecks, FileText, AlertCircle, Wallet, Eye, EyeOff,
-  ArrowRight, RotateCcw, Filter, CheckCircle2, Calculator, Share2,
+  ArrowRight, RotateCcw, RotateCw, Filter, CheckCircle2, Share2,
   Zap, Hash, Users, Banknote, Sparkles, Info, Pencil, ArrowUpDown,
   Send, RefreshCw, Database, ScrollText, Loader2, ArrowLeftRight,
 } from "lucide-react";
@@ -59,6 +59,7 @@ const DAYS = ["Dom","Lun","Mar","Mié","Jue","Vie","Sáb"];
 const monthLabel = today => { const [, mm, yyyy] = today.split("/"); return `${MONTHS[+mm - 1]} ${yyyy}`; };
 const dayName = dateStr => { const [dd, mm, yyyy] = dateStr.split("/"); return DAYS[new Date(+yyyy, +mm - 1, +dd).getDay()]; };
 const dateToTime = ds => { const [dd, mm, yyyy] = ds.split("/"); return new Date(+yyyy, +mm - 1, +dd).getTime(); };
+const timeToMin = t => { if (!t) return 0; const [h, m] = String(t).split(":"); return (+h || 0) * 60 + (+m || 0); };
 const dateMonthKey = ds => ds.slice(3);
 
 
@@ -155,14 +156,27 @@ const driveSync = (() => {
   const SCOPE = "https://www.googleapis.com/auth/drive.file";
   let tokenClient = null;
   let accessToken = localStorage.getItem("plexo-drive-token") || null;
+  let tokenExpiry = +(localStorage.getItem("plexo-drive-tokenexp") || 0);
   let folderId = localStorage.getItem("plexo-drive-folder") || null;
   let jsonFileId = localStorage.getItem("plexo-drive-jsonid") || null;
   let xlsxFileId = localStorage.getItem("plexo-drive-xlsxid") || null;
   let queueTimer = null;
+  let refreshTimer = null;
   let pendingData = null;
+  let needsReconnect = false;
   let listeners = [];
+  let refreshPromise = null;
   const notify = (s) => listeners.forEach(l => l(s));
   const onStatus = (fn) => { listeners.push(fn); return () => { listeners = listeners.filter(l => l !== fn); }; };
+
+  const scheduleProactiveRefresh = () => {
+    clearTimeout(refreshTimer);
+    if (!accessToken || !tokenExpiry) return;
+    // Renovar 5 min antes de expirar, mientras la app esté abierta
+    const ms = Math.max(10000, tokenExpiry - Date.now() - 5 * 60 * 1000);
+    refreshTimer = setTimeout(() => { refreshToken(true); }, ms);
+  };
+
   const init = () => new Promise((resolve) => {
     if (!CLIENT_ID) { resolve(false); return; }
     if (window.google?.accounts?.oauth2) {
@@ -171,10 +185,22 @@ const driveSync = (() => {
         callback: (resp) => {
           if (resp.access_token) {
             accessToken = resp.access_token;
+            // GIS tokens duran ~3600s
+            const ttl = (resp.expires_in ? +resp.expires_in : 3600) * 1000;
+            tokenExpiry = Date.now() + ttl;
+            needsReconnect = false;
             localStorage.setItem("plexo-drive-token", accessToken);
-            notify({ connected: true });
+            localStorage.setItem("plexo-drive-tokenexp", String(tokenExpiry));
+            notify({ connected: true, needsReconnect: false });
+            scheduleProactiveRefresh();
+            if (refreshPromise) { refreshPromise.resolve(true); refreshPromise = null; }
             if (pendingData) { syncNow(pendingData); pendingData = null; }
+          } else if (refreshPromise) {
+            refreshPromise.resolve(false); refreshPromise = null;
           }
+        },
+        error_callback: () => {
+          if (refreshPromise) { refreshPromise.resolve(false); refreshPromise = null; }
         },
       });
       resolve(true);
@@ -187,20 +213,57 @@ const driveSync = (() => {
       document.head.appendChild(s);
     }
   });
+
+  // Renovación silenciosa: prompt:'' no muestra popup si la sesión de Google sigue activa
+  const refreshToken = async (silent) => {
+    const ok = await init();
+    if (!ok || !tokenClient) return false;
+    if (refreshPromise) return refreshPromise.p;
+    let resolveFn;
+    const p = new Promise(r => { resolveFn = r; });
+    refreshPromise = { p, resolve: resolveFn };
+    try {
+      tokenClient.requestAccessToken({ prompt: silent ? "" : "consent" });
+    } catch {
+      if (refreshPromise) { refreshPromise.resolve(false); refreshPromise = null; }
+    }
+    const result = await p;
+    if (!result && silent) {
+      needsReconnect = true;
+      notify({ connected: true, needsReconnect: true });
+    }
+    return result;
+  };
+
   const connect = async () => {
     const ok = await init();
     if (!ok || !tokenClient) { alert("Drive no configurado"); return; }
-    tokenClient.requestAccessToken();
+    needsReconnect = false;
+    tokenClient.requestAccessToken({ prompt: accessToken ? "" : "consent" });
   };
   const disconnect = () => {
     accessToken = null; folderId = null; jsonFileId = null; xlsxFileId = null;
-    ["token","folder","jsonid","xlsxid","lastsync"].forEach(k => localStorage.removeItem("plexo-drive-"+k));
-    notify({ connected: false });
+    tokenExpiry = 0; needsReconnect = false;
+    clearTimeout(refreshTimer);
+    ["token","tokenexp","folder","jsonid","xlsxid","lastsync"].forEach(k => localStorage.removeItem("plexo-drive-"+k));
+    notify({ connected: false, needsReconnect: false });
   };
   const isConnected = () => !!accessToken;
-  const apiCall = async (url, options = {}) => {
+  const getNeedsReconnect = () => needsReconnect;
+
+  const apiCall = async (url, options = {}, _retried) => {
+    // Si el token está vencido o por vencer, intentar refresh silencioso primero
+    if (accessToken && tokenExpiry && Date.now() > tokenExpiry - 60000 && !_retried) {
+      await refreshToken(true);
+    }
     const res = await fetch(url, { ...options, headers: { ...options.headers, Authorization: `Bearer ${accessToken}` } });
-    if (res.status === 401) { disconnect(); throw new Error("Sesión expiró"); }
+    if (res.status === 401 && !_retried) {
+      const refreshed = await refreshToken(true);
+      if (refreshed) return apiCall(url, options, true);
+      needsReconnect = true;
+      notify({ connected: true, needsReconnect: true });
+      throw new Error("Sesión expiró — reconectá Drive");
+    }
     return res;
   };
   const ensureFolder = async () => {
@@ -288,9 +351,10 @@ const driveSync = (() => {
       localStorage.setItem("plexo-drive-xlsxid", xlsxFileId);
       const now = new Date().toISOString();
       localStorage.setItem("plexo-drive-lastsync", now);
-      notify({ syncing: false, success: true, lastSync: now });
+      needsReconnect = false;
+      notify({ syncing: false, success: true, lastSync: now, needsReconnect: false });
     } catch (e) {
-      notify({ syncing: false, error: e.message });
+      notify({ syncing: false, error: e.message, needsReconnect });
     }
   };
   const queueSync = (data) => {
@@ -298,7 +362,9 @@ const driveSync = (() => {
     clearTimeout(queueTimer);
     queueTimer = setTimeout(() => syncNow(data), 3000);
   };
-  return { init, connect, disconnect, isConnected, syncNow, queueSync, onStatus, getLastSync: () => localStorage.getItem("plexo-drive-lastsync") };
+  // Al cargar: si hay token guardado, programar refresh proactivo
+  if (accessToken && tokenExpiry) scheduleProactiveRefresh();
+  return { init, connect, disconnect, isConnected, syncNow, queueSync, onStatus, refreshToken, getNeedsReconnect, getLastSync: () => localStorage.getItem("plexo-drive-lastsync") };
 })();
 
 // ═══════════════════════════════════════════════════════════════════
@@ -616,21 +682,66 @@ function Toast({ toast, onDismiss }) {
 //  MAIN APP
 // ═══════════════════════════════════════════════════════════════════
 export default function App() {
-  const [ops, setOps] = useState([]);
+  const [ops, setOpsRaw] = useState([]);
   const [prefs, setPrefs] = useState({});
   const [ready, setReady] = useState(false);
   const [tab, setTab] = useState("inicio");
   const [sheet, setSheet] = useState(null);
   const [toast, setToast] = useState(null);
-  const [showCalc, setShowCalc] = useState(false);
 
-  // Undo/Redo stacks
-  const undoStack = useRef([]);
-  const redoStack = useRef([]);
+  // ── Undo/Redo basado en snapshots (hasta 50) ──
+  const history = useRef([]);      // array de snapshots de ops
+  const histIndex = useRef(-1);    // posición actual en history
+  const isTimeTravel = useRef(false);
+  const [histVer, setHistVer] = useState(0); // fuerza re-render de los botones
+
+  const HIST_MAX = 50;
+
+  // setOps que registra snapshot en el historial
+  const setOps = useCallback((updater) => {
+    setOpsRaw(prev => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      if (!isTimeTravel.current) {
+        // Cortar cualquier "redo" futuro
+        if (histIndex.current < history.current.length - 1) {
+          history.current = history.current.slice(0, histIndex.current + 1);
+        }
+        history.current.push(JSON.parse(JSON.stringify(next)));
+        if (history.current.length > HIST_MAX) history.current.shift();
+        histIndex.current = history.current.length - 1;
+        setHistVer(v => v + 1);
+      }
+      return next;
+    });
+  }, []);
+
+  const canUndo = histIndex.current > 0;
+  const canRedo = histIndex.current < history.current.length - 1;
+
+  const doUndo = useCallback(() => {
+    if (histIndex.current <= 0) return;
+    histIndex.current -= 1;
+    isTimeTravel.current = true;
+    setOpsRaw(JSON.parse(JSON.stringify(history.current[histIndex.current])));
+    setHistVer(v => v + 1);
+    setTimeout(() => { isTimeTravel.current = false; }, 0);
+  }, []);
+
+  const doRedo = useCallback(() => {
+    if (histIndex.current >= history.current.length - 1) return;
+    histIndex.current += 1;
+    isTimeTravel.current = true;
+    setOpsRaw(JSON.parse(JSON.stringify(history.current[histIndex.current])));
+    setHistVer(v => v + 1);
+    setTimeout(() => { isTimeTravel.current = false; }, 0);
+  }, []);
 
   useEffect(() => {
     Promise.all([loadOps(), loadPrefs()]).then(([o, p]) => {
-      setOps(o); setPrefs(p); setReady(true);
+      setOpsRaw(o); setPrefs(p); setReady(true);
+      // Snapshot inicial
+      history.current = [JSON.parse(JSON.stringify(o))];
+      histIndex.current = 0;
     });
   }, []);
 
@@ -703,87 +814,62 @@ export default function App() {
   }, []);
   const dismissToast = useCallback(() => setToast(null), []);
 
-  // ── State actions with undo support ──
-  const pushUndo = useCallback((action) => {
-    undoStack.current.push(action);
-    if (undoStack.current.length > 20) undoStack.current.shift();
-    redoStack.current = [];
-  }, []);
-
+  // ── State actions (undo/redo via snapshots) ──
   const addOp = useCallback((data) => {
-    const newOp = { ...data, id: uid(), tts: [], notes: data.notes || "", ts: Date.now(), createdAt: Date.now() };
-    setOps(p => {
-      const next = [...p, newOp];
-      pushUndo({ kind: "addOp", op: newOp });
-      return next;
-    });
+    const now = new Date();
+    const hhmm = `${String(now.getHours()).padStart(2,"0")}:${String(now.getMinutes()).padStart(2,"0")}`;
+    const newOp = { ...data, id: uid(), tts: [], notes: data.notes || "", ts: Date.now(), createdAt: Date.now(), time: data.time || hhmm };
+    setOps(p => [...p, newOp]);
     setSheet(null);
-    notify(`✓ Operación creada con ${data.client}`, { undo: () => {
-      setOps(p => p.filter(o => o.id !== newOp.id));
-      notify("Operación deshecha");
-    }});
-  }, [pushUndo, notify]);
+    notify(`✓ Operación creada con ${data.client}`);
+  }, [setOps, notify]);
 
   const updateOp = useCallback((id, updates) => {
-    setOps(p => {
-      const prev = p.find(o => o.id === id);
-      if (prev) pushUndo({ kind: "updateOp", id, prev: { ...prev } });
-      return p.map(o => o.id === id ? { ...o, ...updates } : o);
-    });
-  }, [pushUndo]);
+    setOps(p => p.map(o => o.id === id ? { ...o, ...updates } : o));
+  }, [setOps]);
 
   const addTTs = useCallback((opId, amounts) => {
     setOps(p => p.map(o => {
       if (o.id !== opId) return o;
       const newTTs = amounts.map(a => ({ id: uid(), amount: a, ts: Date.now(), verified: false }));
-      pushUndo({ kind: "addTTs", opId, addedIds: newTTs.map(t => t.id) });
       return { ...o, tts: [...o.tts, ...newTTs] };
     }));
     const count = amounts.length;
-    notify(`✓ ${count} TT${count > 1 ? "s" : ""} agregada${count > 1 ? "s" : ""}`, {
-      undo: () => {
-        setOps(p => p.map(o => o.id === opId ? { ...o, tts: o.tts.slice(0, o.tts.length - count) } : o));
-        notify("TTs deshechas");
-      },
-    });
-  }, [pushUndo, notify]);
+    notify(`✓ ${count} TT${count > 1 ? "s" : ""} agregada${count > 1 ? "s" : ""}`);
+  }, [setOps, notify]);
 
   const delTT = useCallback((opId, ttId) => {
     let removed = null;
     setOps(p => p.map(o => {
       if (o.id !== opId) return o;
-      const idx = o.tts.findIndex(t => t.id === ttId);
-      removed = o.tts[idx];
+      removed = o.tts.find(t => t.id === ttId);
       return { ...o, tts: o.tts.filter(t => t.id !== ttId) };
     }));
-    notify(`TT de ${fmtARS(removed?.amount || 0)} eliminada`, {
-      undo: () => {
-        setOps(p => p.map(o => o.id === opId ? { ...o, tts: [...o.tts, removed] } : o));
-        notify("TT restaurada");
-      },
-    });
-  }, [notify]);
+    notify(`TT eliminada`);
+  }, [setOps, notify]);
 
   const delOp = useCallback((id) => {
     const removed = ops.find(o => o.id === id);
     setOps(p => p.filter(o => o.id !== id));
     setSheet(null);
-    notify(`Operación de ${removed?.client} eliminada`, {
-      undo: () => {
-        setOps(p => [...p, removed]);
-        notify("Operación restaurada");
-      },
-    });
-  }, [ops, notify]);
+    notify(`Operación de ${removed?.client || ""} eliminada`);
+  }, [ops, setOps, notify]);
 
-  const duplicateOp = useCallback((id) => {
-    const orig = ops.find(o => o.id === id);
-    if (!orig) return;
-    const dup = { ...orig, id: uid(), date: todayStr(), tts: [], ts: Date.now(), createdAt: Date.now() };
-    setOps(p => [...p, dup]);
-    setSheet({ kind: "detail", id: dup.id });
-    notify(`✓ Operación duplicada para ${orig.client}`);
-  }, [ops, notify]);
+  // Marcar saldada (manualClosed) — una op o todas las de un cliente
+  const markClientSettled = useCallback((clientName) => {
+    setOps(p => p.map(o => o.client === clientName ? { ...o, manualClosed: true } : o));
+    notify(`✓ ${clientName} marcado como saldado`);
+  }, [setOps, notify]);
+
+  const toggleOpSettled = useCallback((id) => {
+    let nowClosed = false;
+    setOps(p => p.map(o => {
+      if (o.id !== id) return o;
+      nowClosed = !o.manualClosed;
+      return { ...o, manualClosed: !o.manualClosed };
+    }));
+    notify(nowClosed ? "✓ Operación marcada saldada" : "Operación reabierta");
+  }, [setOps, notify]);
 
   // ── Memoized data ──
   const today = todayStr();
@@ -812,6 +898,16 @@ export default function App() {
     return s + Math.max(0, tot - sent);
   }, 0), [todayOps]);
 
+  // Estado global de Drive (para banner de alerta)
+  const [driveAlert, setDriveAlert] = useState(driveSync.isConnected() && driveSync.getNeedsReconnect());
+  useEffect(() => {
+    const unsub = driveSync.onStatus((s) => {
+      if (s.needsReconnect !== undefined) setDriveAlert(driveSync.isConnected() && s.needsReconnect);
+    });
+    return unsub;
+  }, []);
+  const reconnectDrive = useCallback(async () => { await driveSync.connect(); }, []);
+
   if (!ready) return <Loader />;
 
   return (
@@ -824,9 +920,20 @@ export default function App() {
       <Styles />
       <BgGrid />
 
+      {driveAlert && (
+        <button onClick={reconnectDrive} style={{
+          position: "relative", zIndex: 2, width: "100%",
+          background: C.warnDim, borderBottom: `1px solid ${C.warn}55`,
+          color: C.warn, padding: "10px 16px", fontSize: 12, fontWeight: 700,
+          fontFamily: "inherit", display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+        }}>
+          <AlertCircle size={14} /> Drive desconectado — tocá para reconectar
+        </button>
+      )}
+
       <div style={{ position: "relative", zIndex: 1 }}>
         {tab === "inicio" && <InicioScreen
-          ops={ops} todayOps={todayOps} today={today} totalPending={totalPendingToday}
+          ops={ops} today={today}
           onNew={() => setSheet({ kind: "new" })}
           onDetail={id => setSheet({ kind: "detail", id })}
           onPresent={id => setSheet({ kind: "present", id })}
@@ -836,6 +943,7 @@ export default function App() {
         {tab === "saldos" && <SaldosScreen
           ops={ops}
           onClient={(name) => setSheet({ kind: "saldoCliente", client: name })}
+          onMarkClient={markClientSettled}
         />}
         {tab === "ganancias" && <GananciasScreen
           ops={ops} months={months} currentMonth={currentMonth}
@@ -851,7 +959,7 @@ export default function App() {
 
       <BottomNav tab={tab} onChange={setTab} onSettings={() => setSheet({ kind: "settings" })} />
 
-      <FloatingCalc onClick={() => setShowCalc(true)} />
+      {tab === "inicio" && <UndoFab canUndo={canUndo} canRedo={canRedo} onUndo={doUndo} onRedo={doRedo} />}
 
       {sheet?.kind === "new" && <NewOpSheet
         onClose={() => setSheet(null)} onSave={addOp}
@@ -860,7 +968,7 @@ export default function App() {
       {detailOp && <OpDetailSheet
         op={detailOp} onClose={() => setSheet(null)}
         onAddTTs={addTTs} onDelTT={delTT} onDelOp={delOp}
-        onUpdate={updateOp} onDuplicate={duplicateOp}
+        onUpdate={updateOp}
         onPresent={() => setSheet({ kind: "present", id: detailOp.id })}
         notify={notify}
       />}
@@ -884,10 +992,10 @@ export default function App() {
         clientName={sheet.client} ops={ops}
         onClose={() => setSheet(null)}
         onDetail={id => setSheet({ kind: "detail", id })}
+        onMarkClient={markClientSettled}
+        onToggleOp={toggleOpSettled}
         notify={notify}
       />}
-
-      {showCalc && <CalcSheet onClose={() => setShowCalc(false)} />}
 
       {toast && <Toast toast={toast} onDismiss={dismissToast} />}
     </div>
@@ -947,29 +1055,55 @@ function Loader() {
 // ═══════════════════════════════════════════════════════════════════
 //  SCREEN · INICIO
 // ═══════════════════════════════════════════════════════════════════
-function InicioScreen({ ops, todayOps, today, totalPending, onNew, onDetail, onPresent, onQuickAddTT, onDelete }) {
+function InicioScreen({ ops, today, onNew, onDetail, onPresent, onQuickAddTT, onDelete }) {
   const [showHistory, setShowHistory] = useState(false);
   const [search, setSearch] = useState("");
   const [showSearch, setShowSearch] = useState(false);
-  const [showHidden, setShowHidden] = useState(false);
-  
-  // Filtrar ocultas
-  const visibleToday = todayOps.filter(op => showHidden || !op.hidden);
 
-  const past = ops.filter(o => o.date !== today && (showHidden || !o.hidden));
-  const byDate = past.reduce((acc, o) => { (acc[o.date] = acc[o.date] || []).push(o); return acc; }, {});
-  const pastDates = Object.keys(byDate).sort((a, b) => dateToTime(b) - dateToTime(a));
+  // Determinar si una op está "completa" (saldada manual o diferencia < $1)
+  const isComplete = (op) => {
+    if (op.manualClosed) return true;
+    const total = op.usdtAmount * op.tcClient;
+    const sent = op.tts.reduce((s, t) => s + t.amount, 0);
+    return Math.abs(total - sent) < 1;
+  };
 
-  // Quick search filter
+  // Ordenador por fecha + hora (más reciente primero)
+  const byDateTime = (a, b) => {
+    const ta = dateToTime(a.date) + (a.time ? timeToMin(a.time) * 60000 : 0);
+    const tb = dateToTime(b.date) + (b.time ? timeToMin(b.time) * 60000 : 0);
+    if (tb !== ta) return tb - ta;
+    return (b.createdAt || 0) - (a.createdAt || 0);
+  };
+
+  // Filtro de búsqueda (solo cliente — search inteligente)
   const filterFn = (op) => {
     if (!search.trim()) return true;
     const q = search.toLowerCase().trim();
-    return op.client.toLowerCase().includes(q) ||
-           op.bank?.toLowerCase().includes(q) ||
-           op.exchange?.toLowerCase().includes(q) ||
-           op.notes?.toLowerCase().includes(q);
+    const qDigits = q.replace(/\D/g, "");
+    if (op.client.toLowerCase().includes(q)) return true;
+    if (qDigits) {
+      const total = Math.round(op.usdtAmount * op.tcClient);
+      if (String(total).includes(qDigits)) return true;
+      if (String(Math.round(op.usdtAmount)).includes(qDigits)) return true;
+      if (String(op.tcClient).replace(/\D/g, "").includes(qDigits)) return true;
+      if (op.tts.some(t => String(Math.round(t.amount)).includes(qDigits))) return true;
+    }
+    return false;
   };
-  const filteredToday = visibleToday.filter(filterFn);
+
+  const activas = ops.filter(o => !isComplete(o)).filter(filterFn).sort(byDateTime);
+  const historial = ops.filter(o => isComplete(o)).filter(filterFn).sort(byDateTime);
+
+  // Agrupar historial por fecha
+  const histByDate = historial.reduce((acc, o) => { (acc[o.date] = acc[o.date] || []).push(o); return acc; }, {});
+  const histDates = Object.keys(histByDate).sort((a, b) => dateToTime(b) - dateToTime(a));
+
+  const totalPending = activas.reduce((s, op) => {
+    const tot = op.usdtAmount * op.tcClient;
+    const sent = op.tts.reduce((x, t) => x + t.amount, 0);
+    return s + Math.max(0, tot - sent);
+  }, 0);
 
   const [dd, mm] = today.split("/");
 
@@ -994,7 +1128,7 @@ function InicioScreen({ ops, todayOps, today, totalPending, onNew, onDetail, onP
             border: `1px solid ${showSearch ? C.accent : C.border}`,
             color: showSearch ? C.accent : C.soft,
             display: "flex", alignItems: "center", justifyContent: "center",
-            transition: `all 0.2s ${EASE}`,
+            transition: `all 0.2s ${EASE}`, marginRight: 84,
           }}>
             <Search size={16} />
           </button>
@@ -1004,7 +1138,7 @@ function InicioScreen({ ops, todayOps, today, totalPending, onNew, onDetail, onP
           <div style={{ marginTop: 12, animation: "fadeUp 0.3s ease" }}>
             <input
               autoFocus value={search} onChange={e => setSearch(e.target.value)}
-              placeholder="Buscar por cliente, banco, nota…"
+              placeholder="Buscar por cliente o monto…"
               style={{
                 width: "100%", padding: "11px 14px", borderRadius: 11,
                 background: "rgba(255,255,255,0.03)", border: `1px solid ${C.border}`,
@@ -1027,12 +1161,23 @@ function InicioScreen({ ops, todayOps, today, totalPending, onNew, onDetail, onP
       <div style={{ padding: "0 16px" }}>
         <NewOpButton onClick={onNew} />
 
-        {filteredToday.length === 0 ? (
+        {/* OPERACIONES ACTIVAS */}
+        <div style={{
+          display: "flex", alignItems: "center", gap: 10, color: C.accent, fontSize: 11,
+          fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.16em",
+          marginBottom: 14, width: "100%", padding: "4px 0",
+        }}>
+          <div style={{ flex: 1, height: 1, background: `${C.accent}33` }} />
+          <span>Operaciones activas · {activas.length}</span>
+          <div style={{ flex: 1, height: 1, background: `${C.accent}33` }} />
+        </div>
+
+        {activas.length === 0 ? (
           search ? <Empty label="Sin resultados" />
-                 : <Empty label="Sin operaciones hoy" cta="Tocá + Nueva operación para empezar" />
+                 : <Empty label="Sin operaciones activas" cta="Tocá + Nueva operación para empezar" />
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 9, marginBottom: 24, animation: "fadeUp 0.3s ease" }}>
-            {filteredToday.map(op => (
+            {activas.map(op => (
               <OpCard key={op.id} op={op}
                 onClick={() => onDetail(op.id)}
                 onQuickAddTT={() => onQuickAddTT(op.id)}
@@ -1042,29 +1187,30 @@ function InicioScreen({ ops, todayOps, today, totalPending, onNew, onDetail, onP
           </div>
         )}
 
+        {/* HISTORIAL */}
         <button onClick={() => setShowHistory(h => !h)} style={{
           display: "flex", alignItems: "center", gap: 10, color: C.soft, fontSize: 11,
           fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.16em",
           marginBottom: 16, width: "100%", padding: "8px 0",
         }}>
           <div style={{ flex: 1, height: 1, background: C.border }} />
-          <span>Historial · {pastDates.length} día{pastDates.length !== 1 ? "s" : ""}</span>
+          <span>Historial · {historial.length} op{historial.length !== 1 ? "s" : ""}</span>
           <div style={{ flex: 1, height: 1, background: C.border }} />
           <ChevronDown size={12} style={{ transform: showHistory ? "rotate(180deg)" : "none", transition: `transform 0.3s ${EASE}` }} />
         </button>
 
         {showHistory && (
-          pastDates.length === 0
+          histDates.length === 0
             ? <Empty label="Sin historial" />
-            : pastDates.map(date => (
+            : histDates.map(date => (
               <div key={date} style={{ marginBottom: 18, animation: "fadeUp 0.3s ease" }}>
                 <div style={{ fontSize: 10, color: C.muted, textTransform: "uppercase", letterSpacing: "0.16em", marginBottom: 8, display: "flex", alignItems: "center", gap: 10 }}>
                   <span>{date.slice(0, 5)}</span>
                   <div style={{ flex: 1, height: 1, background: C.border }} />
-                  <span>{byDate[date].length} op{byDate[date].length !== 1 ? "s" : ""}</span>
+                  <span>{histByDate[date].length} op{histByDate[date].length !== 1 ? "s" : ""}</span>
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                  {byDate[date].filter(filterFn).map(op => (
+                  {histByDate[date].map(op => (
                     <OpCard key={op.id} op={op}
                       onClick={() => onDetail(op.id)}
                       onQuickAddTT={() => onQuickAddTT(op.id)}
@@ -1185,9 +1331,8 @@ function OpCard({ op, onClick, onQuickAddTT, onPresent, onDelete }) {
                 {nearComplete && <span style={{ fontSize: 8, fontWeight: 800, padding: "2px 6px", borderRadius: 4, background: C.warnDim, color: C.warn, letterSpacing: "0.1em" }}>CASI</span>}
                 {overshoot && <span style={{ fontSize: 8, fontWeight: 800, padding: "2px 6px", borderRadius: 4, background: C.warnDim, color: C.warn, letterSpacing: "0.1em" }}>+EXC</span>}
               </div>
-              <div style={{ fontSize: 11, color: C.muted }}>
-                {op.exchange || "—"} · {op.bank}
-                {op.notes && <span style={{ marginLeft: 8, color: C.accent2 }}>· nota</span>}
+              <div style={{ fontSize: 10, color: C.muted, fontFamily: "'JetBrains Mono', monospace", marginTop: 1 }}>
+                {op.date.slice(0, 5)}
               </div>
             </div>
             <div style={{ textAlign: "right", marginLeft: 8 }}>
@@ -1207,27 +1352,27 @@ function OpCard({ op, onClick, onQuickAddTT, onPresent, onDelete }) {
           </div>
 
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 11 }}>
-            <span style={{ color: C.muted }}>
-              Env. <span style={{ color: C.text, fontFamily: "'JetBrains Mono', monospace" }}>{fmtARS(sent)}</span>
-            </span>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <span style={{
-                color: done ? tc.primary : overshoot ? C.warn : nearComplete ? C.warn : C.accent2,
-                fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: 11,
-              }}>
-                {done ? "✓ Completo" : overshoot ? `+${fmtARS(-remaining)}` : `−${fmtARS(remaining)}`}
+            {done ? (
+              <span style={{ color: tc.primary, fontFamily: "'JetBrains Mono', monospace", fontWeight: 700 }}>✓ Completo</span>
+            ) : remaining > 0 ? (
+              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: 12, color: C.negative }}>
+                ME DEBE {fmtARS(remaining)}
               </span>
-              {!done && (
-                <button onClick={e => { e.stopPropagation(); onQuickAddTT(); }} style={{
-                  width: 26, height: 26, borderRadius: 8,
-                  background: C.accentDim, border: `1px solid ${C.accent}44`, color: C.accent,
-                  display: "flex", alignItems: "center", justifyContent: "center",
-                  transition: `all 0.2s ${EASE}`,
-                }} title="Agregar TT rápido">
-                  <Zap size={12} strokeWidth={2.5} />
-                </button>
-              )}
-            </div>
+            ) : (
+              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: 12, color: C.accent2 }}>
+                LE QUEDA A FAVOR {fmtARS(-remaining)}
+              </span>
+            )}
+            {!done && (
+              <button onClick={e => { e.stopPropagation(); onQuickAddTT(); }} style={{
+                width: 26, height: 26, borderRadius: 8,
+                background: C.accentDim, border: `1px solid ${C.accent}44`, color: C.accent,
+                display: "flex", alignItems: "center", justifyContent: "center",
+                transition: `all 0.2s ${EASE}`,
+              }} title="Agregar TT rápido">
+                <Zap size={12} strokeWidth={2.5} />
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -1461,8 +1606,9 @@ function BuscarScreen({ ops, onDetail }) {
   const allClients = useMemo(() => [...new Set(ops.map(o => o.client))].sort(), [ops]);
   const allBanks = useMemo(() => [...new Set(ops.map(o => o.bank))].sort(), [ops]);
 
-  const isNumQuery = query.trim() && /^[\d.,\s$]+$/.test(query.trim());
-  const queryNum = isNumQuery ? parseNum(query) : null;
+  const q = query.toLowerCase().trim();
+  const qDigits = q.replace(/\D/g, "");
+  const hasText = q && /[a-zñáéíóú]/.test(q);
 
   const results = useMemo(() => {
     const out = [];
@@ -1471,30 +1617,39 @@ function BuscarScreen({ ops, onDetail }) {
       if (filterClient !== "all" && op.client !== filterClient) continue;
       if (filterBank !== "all" && op.bank !== filterBank) continue;
 
-      if (!query.trim()) {
+      if (!q) { out.push({ kind: "op", op }); continue; }
+
+      let matched = false;
+
+      // Match por texto: cliente, banco, exchange, nota
+      if (op.client.toLowerCase().includes(q) ||
+          (op.bank || "").toLowerCase().includes(q) ||
+          (op.exchange || "").toLowerCase().includes(q) ||
+          (op.notes || "").toLowerCase().includes(q)) {
         out.push({ kind: "op", op });
-        continue;
+        matched = true;
       }
 
-      if (isNumQuery) {
-        // Match TT amount exactly
+      // Match parcial por dígitos (ignora puntos/comas): total, usdt, tc, fecha, TTs
+      if (!hasText && qDigits) {
+        const total = String(Math.round(op.usdtAmount * op.tcClient));
+        const usdt = String(Math.round(op.usdtAmount));
+        const tc = String(op.tcClient).replace(/\D/g, "");
+        const fecha = op.date.replace(/\D/g, "");
+        if (!matched && (total.includes(qDigits) || usdt.includes(qDigits) || tc.includes(qDigits) || fecha.includes(qDigits))) {
+          out.push({ kind: "op", op });
+          matched = true;
+        }
+        // TTs que contengan los dígitos
         op.tts.forEach((tt, idx) => {
-          if (Math.round(tt.amount) === Math.round(queryNum)) {
+          if (String(Math.round(tt.amount)).includes(qDigits)) {
             out.push({ kind: "tt", op, tt, idx });
           }
         });
-      } else {
-        const q = query.toLowerCase().trim();
-        if (op.client.toLowerCase().includes(q) ||
-            op.bank?.toLowerCase().includes(q) ||
-            op.exchange?.toLowerCase().includes(q) ||
-            (op.notes || "").toLowerCase().includes(q)) {
-          out.push({ kind: "op", op });
-        }
       }
     }
     return out.sort((a, b) => dateToTime(b.op.date) - dateToTime(a.op.date));
-  }, [ops, query, filterType, filterClient, filterBank, isNumQuery, queryNum]);
+  }, [ops, q, qDigits, hasText, filterType, filterClient, filterBank]);
 
   return (
     <div>
@@ -1515,7 +1670,7 @@ function BuscarScreen({ ops, onDetail }) {
               width: "100%", padding: "13px 14px 13px 38px", borderRadius: 13,
               background: "rgba(255,255,255,0.03)", border: `1px solid ${C.border}`,
               color: C.text, fontSize: 14,
-              fontFamily: isNumQuery ? "'JetBrains Mono', monospace" : "inherit",
+              fontFamily: "inherit",
             }}
           />
           {query && (
@@ -1528,9 +1683,7 @@ function BuscarScreen({ ops, onDetail }) {
         {/* Search hint */}
         {query.trim() && (
           <div style={{ fontSize: 11, color: C.muted, marginBottom: 12, display: "flex", alignItems: "center", gap: 6 }}>
-            {isNumQuery
-              ? <><Hash size={11} /> Buscando TT por monto exacto: <span style={{ color: C.accent2, fontFamily: "'JetBrains Mono', monospace", fontWeight: 600 }}>{fmtARS(queryNum)}</span></>
-              : <><FileText size={11} /> Buscando texto</>}
+            <Search size={11} /> {results.length} coincidencia{results.length !== 1 ? "s" : ""}
           </div>
         )}
 
@@ -1618,29 +1771,63 @@ function FilterChip({ label, active, onClick, color }) {
 // ═══════════════════════════════════════════════════════════════════
 //  SCREEN · SALDOS
 // ═══════════════════════════════════════════════════════════════════
-function SaldosScreen({ ops, onClient }) {
+function SaldosScreen({ ops, onClient, onMarkClient }) {
   const balances = useMemo(() => calcClientBalances(ops), [ops]);
-  const totalNeto = balances.reduce((s, c) => s + c.balance, 0);
+  const [query, setQuery] = useState("");
+  const [showSearch, setShowSearch] = useState(false);
+  const [confirmClient, setConfirmClient] = useState(null);
+  const pressTimer = useRef(null);
+
+  const filtered = query.trim()
+    ? balances.filter(b => b.client.toLowerCase().includes(query.toLowerCase().trim()))
+    : balances;
+  const totalNeto = filtered.reduce((s, c) => s + c.balance, 0);
+
+  const startPress = (client) => {
+    pressTimer.current = setTimeout(() => setConfirmClient(client), 550);
+  };
+  const cancelPress = () => { if (pressTimer.current) clearTimeout(pressTimer.current); };
 
   return (
     <div style={{ animation: "fadeUp 0.4s ease" }}>
       <header style={{ padding: "26px 22px 16px" }}>
-        <div style={{ fontSize: 10, color: C.muted, textTransform: "uppercase", letterSpacing: "0.24em", marginBottom: 7, fontWeight: 700, display: "flex", alignItems: "center", gap: 8 }}>
-          <Wallet size={11} color={C.accent2} /> Saldos pendientes
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+          <div>
+            <div style={{ fontSize: 10, color: C.muted, textTransform: "uppercase", letterSpacing: "0.24em", marginBottom: 7, fontWeight: 700, display: "flex", alignItems: "center", gap: 8 }}>
+              <Wallet size={11} color={C.accent2} /> Saldos pendientes
+            </div>
+            <h1 style={{ fontSize: 30, fontWeight: 800, letterSpacing: "-0.03em", margin: 0, lineHeight: 1 }}>Saldos</h1>
+          </div>
+          <button onClick={() => { setShowSearch(s => !s); if (showSearch) setQuery(""); }} style={{
+            width: 38, height: 38, borderRadius: 12,
+            background: showSearch ? C.accentDim : "transparent",
+            border: `1px solid ${showSearch ? C.accent : C.border}`,
+            color: showSearch ? C.accent : C.soft,
+            display: "flex", alignItems: "center", justifyContent: "center",
+          }}>
+            <Search size={16} />
+          </button>
         </div>
-        <h1 style={{ fontSize: 30, fontWeight: 800, letterSpacing: "-0.03em", margin: 0, lineHeight: 1 }}>Saldos</h1>
-        {balances.length > 0 && (
+
+        {showSearch && (
+          <div style={{ marginTop: 12, animation: "fadeUp 0.3s ease" }}>
+            <input autoFocus value={query} onChange={e => setQuery(e.target.value)}
+              placeholder="Buscar cliente por nombre…"
+              style={{ width: "100%", padding: "11px 14px", borderRadius: 11, background: "rgba(255,255,255,0.03)", border: `1px solid ${C.border}`, color: C.text, fontSize: 14 }} />
+          </div>
+        )}
+
+        {filtered.length > 0 && (
           <div style={{ marginTop: 11, fontSize: 11, color: C.muted, fontFamily: "'JetBrains Mono', monospace" }}>
             Balance neto · <span style={{ color: totalNeto >= 0 ? C.negative : C.accent2, fontWeight: 700 }}>{fmtARS(Math.abs(totalNeto))}</span>
           </div>
         )}
       </header>
 
-      {balances.length === 0 ? (
-        <Empty label="Sin saldos pendientes" cta="Las operaciones completas o saldadas no aparecen acá" />
+      {filtered.length === 0 ? (
+        <Empty label={query ? "Sin coincidencias" : "Sin saldos pendientes"} cta={query ? null : "Las operaciones completas o saldadas no aparecen acá"} />
       ) : (
         <div style={{ padding: "0 18px" }}>
-          {/* Header tabla */}
           <div style={{
             display: "grid", gridTemplateColumns: "1fr 46px 1.4fr",
             padding: "9px 12px", borderBottom: `1px solid ${C.border}`,
@@ -1651,19 +1838,23 @@ function SaldosScreen({ ops, onClient }) {
             <span style={{ textAlign: "right" }}>Saldo</span>
           </div>
 
-          {balances.map((cb, i) => {
+          {filtered.map((cb, i) => {
             const meDebe = cb.balance > 0;
             const color = meDebe ? C.negative : C.accent2;
             const label = meDebe ? "ME DEBE" : "LE QUEDA A FAVOR";
             return (
-              <button key={cb.client} onClick={() => onClient(cb.client)} style={{
-                display: "grid", gridTemplateColumns: "1fr 46px 1.4fr",
-                width: "100%", padding: "15px 12px", alignItems: "center", textAlign: "left",
-                borderBottom: i < balances.length - 1 ? `1px solid ${C.border}` : "none",
-                background: "transparent", transition: `background 0.2s ${EASE}`,
-              }}
-              onTouchStart={e => e.currentTarget.style.background = "rgba(255,255,255,0.03)"}
-              onTouchEnd={e => e.currentTarget.style.background = "transparent"}>
+              <button key={cb.client}
+                onClick={() => onClient(cb.client)}
+                onTouchStart={() => startPress(cb.client)}
+                onTouchEnd={cancelPress}
+                onTouchMove={cancelPress}
+                onContextMenu={e => { e.preventDefault(); setConfirmClient(cb.client); }}
+                style={{
+                  display: "grid", gridTemplateColumns: "1fr 46px 1.4fr",
+                  width: "100%", padding: "15px 12px", alignItems: "center", textAlign: "left",
+                  borderBottom: i < filtered.length - 1 ? `1px solid ${C.border}` : "none",
+                  background: "transparent", transition: `background 0.2s ${EASE}`,
+                }}>
                 <span style={{ fontSize: 15, fontWeight: 700, color: C.text }}>{cb.client}</span>
                 <span style={{ textAlign: "center", fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: C.muted }}>{cb.ops.length}</span>
                 <div style={{ textAlign: "right" }}>
@@ -1679,6 +1870,28 @@ function SaldosScreen({ ops, onClient }) {
           })}
         </div>
       )}
+
+      {/* Confirmación marcar saldado (cliente completo) */}
+      {confirmClient && (
+        <>
+          <div onClick={() => setConfirmClient(null)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.8)", zIndex: 200, backdropFilter: "blur(6px)", animation: "fadeIn 0.2s ease" }} />
+          <div style={{
+            position: "fixed", left: "50%", top: "50%", transform: "translate(-50%, -50%)",
+            zIndex: 201, width: "85%", maxWidth: 360,
+            background: "rgba(12,7,20,0.99)", border: `1px solid ${C.borderStrong}`,
+            borderRadius: 20, padding: "24px 22px", animation: "fadeUp 0.25s ease",
+          }}>
+            <div style={{ fontSize: 17, fontWeight: 800, color: C.text, marginBottom: 8 }}>Marcar como saldado</div>
+            <div style={{ fontSize: 13, color: C.soft, lineHeight: 1.5, marginBottom: 20 }}>
+              Se marcarán TODAS las operaciones de <b style={{ color: C.text }}>{confirmClient}</b> como completas. Desaparece de Saldos.
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <button onClick={() => setConfirmClient(null)} style={{ padding: 12, borderRadius: 11, border: `1px solid ${C.border}`, color: C.soft, fontSize: 12, fontWeight: 700, fontFamily: "inherit", textTransform: "uppercase", letterSpacing: "0.1em" }}>Cancelar</button>
+              <button onClick={() => { onMarkClient(confirmClient); setConfirmClient(null); }} style={{ padding: 12, borderRadius: 11, background: C.positive, color: C.bg, fontSize: 12, fontWeight: 800, fontFamily: "inherit", textTransform: "uppercase", letterSpacing: "0.1em" }}>Confirmar</button>
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -1686,13 +1899,17 @@ function SaldosScreen({ ops, onClient }) {
 // ═══════════════════════════════════════════════════════════════════
 //  SHEET · DETALLE SALDO CLIENTE
 // ═══════════════════════════════════════════════════════════════════
-function SaldoClienteSheet({ clientName, ops, onClose, onDetail, notify }) {
+function SaldoClienteSheet({ clientName, ops, onClose, onDetail, onMarkClient, onToggleOp, notify }) {
   const balances = useMemo(() => calcClientBalances(ops), [ops]);
   const cb = balances.find(b => b.client === clientName);
 
   const [notes, setNotes] = useState(loadClientNotes());
   const [editingNote, setEditingNote] = useState(false);
   const [noteText, setNoteText] = useState(notes[clientName] || "");
+  const [confirmOp, setConfirmOp] = useState(null);
+  const opPressTimer = useRef(null);
+  const startOpPress = (opId) => { opPressTimer.current = setTimeout(() => setConfirmOp(opId), 550); };
+  const cancelOpPress = () => { if (opPressTimer.current) clearTimeout(opPressTimer.current); };
 
   if (!cb) {
     return (
@@ -1794,18 +2011,26 @@ function SaldoClienteSheet({ clientName, ops, onClose, onDetail, notify }) {
         <span style={{ textAlign: "right" }}>Pendiente</span>
       </div>
 
+      <div style={{ fontSize: 9, color: C.muted, marginBottom: 10, fontStyle: "italic" }}>
+        Tocá para abrir · Mantené presionado para marcar saldada
+      </div>
+
       <div style={{ marginBottom: 8 }}>
         {cb.ops.map((op, i) => {
           const t = T[op.type] || T.venta;
           return (
-            <button key={op.id} onClick={() => onDetail(op.id)} style={{
-              display: "grid", gridTemplateColumns: "52px 1fr 70px 1fr",
-              width: "100%", padding: "14px 10px", alignItems: "center", textAlign: "left",
-              borderBottom: i < cb.ops.length - 1 ? `1px solid ${C.border}` : "none",
-              background: "transparent", transition: `background 0.2s ${EASE}`,
-            }}
-            onTouchStart={e => e.currentTarget.style.background = "rgba(255,255,255,0.03)"}
-            onTouchEnd={e => e.currentTarget.style.background = "transparent"}>
+            <button key={op.id}
+              onClick={() => onDetail(op.id)}
+              onTouchStart={() => startOpPress(op.id)}
+              onTouchEnd={cancelOpPress}
+              onTouchMove={cancelOpPress}
+              onContextMenu={e => { e.preventDefault(); setConfirmOp(op.id); }}
+              style={{
+                display: "grid", gridTemplateColumns: "52px 1fr 70px 1fr",
+                width: "100%", padding: "14px 10px", alignItems: "center", textAlign: "left",
+                borderBottom: i < cb.ops.length - 1 ? `1px solid ${C.border}` : "none",
+                background: "transparent", transition: `background 0.2s ${EASE}`,
+              }}>
               <div>
                 <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13, fontWeight: 700, color: C.text }}>{op.date.slice(0, 5)}</div>
                 <div style={{ fontSize: 8, color: t.primary, fontWeight: 800, letterSpacing: "0.1em", marginTop: 3 }}>{t.label}</div>
@@ -1819,6 +2044,31 @@ function SaldoClienteSheet({ clientName, ops, onClose, onDetail, notify }) {
           );
         })}
       </div>
+
+      {/* Confirmación marcar op individual saldada */}
+      {confirmOp && (() => {
+        const op = cb.ops.find(o => o.id === confirmOp);
+        return (
+          <>
+            <div onClick={() => setConfirmOp(null)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.8)", zIndex: 300, backdropFilter: "blur(6px)", animation: "fadeIn 0.2s ease" }} />
+            <div style={{
+              position: "fixed", left: "50%", top: "50%", transform: "translate(-50%, -50%)",
+              zIndex: 301, width: "85%", maxWidth: 360,
+              background: "rgba(12,7,20,0.99)", border: `1px solid ${C.borderStrong}`,
+              borderRadius: 20, padding: "24px 22px", animation: "fadeUp 0.25s ease",
+            }}>
+              <div style={{ fontSize: 17, fontWeight: 800, color: C.text, marginBottom: 8 }}>Marcar saldada</div>
+              <div style={{ fontSize: 13, color: C.soft, lineHeight: 1.5, marginBottom: 20 }}>
+                La operación del <b style={{ color: C.text }}>{op?.date.slice(0,5)}</b> ({op?.usdt.toLocaleString("es-AR")} USDT) se marca como completa y sale de Saldos.
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                <button onClick={() => setConfirmOp(null)} style={{ padding: 12, borderRadius: 11, border: `1px solid ${C.border}`, color: C.soft, fontSize: 12, fontWeight: 700, fontFamily: "inherit", textTransform: "uppercase", letterSpacing: "0.1em" }}>Cancelar</button>
+                <button onClick={() => { onToggleOp(confirmOp); setConfirmOp(null); }} style={{ padding: 12, borderRadius: 11, background: C.positive, color: C.bg, fontSize: 12, fontWeight: 800, fontFamily: "inherit", textTransform: "uppercase", letterSpacing: "0.1em" }}>Confirmar</button>
+              </div>
+            </div>
+          </>
+        );
+      })()}
     </Sheet>
   );
 }
@@ -1863,21 +2113,24 @@ function BottomNav({ tab, onChange, onSettings }) {
   );
 }
 
-function FloatingCalc({ onClick }) {
-  return (
-    <button onClick={onClick} style={{
-      position: "fixed", right: 18, bottom: 100, zIndex: 60,
-      width: 54, height: 54, borderRadius: 18,
-      background: `linear-gradient(135deg, ${C.accent}, ${C.accent2}cc)`,
-      color: C.bg,
+function UndoFab({ canUndo, canRedo, onUndo, onRedo }) {
+  const btn = (enabled, onClick, Icon) => (
+    <button onClick={enabled ? onClick : undefined} disabled={!enabled} style={{
+      width: 38, height: 38, borderRadius: 12,
+      background: enabled ? "rgba(28,18,42,0.55)" : "transparent",
+      border: `1px solid ${enabled ? C.accent + "44" : "rgba(180,100,220,0.12)"}`,
+      backdropFilter: "blur(10px)",
       display: "flex", alignItems: "center", justifyContent: "center",
-      boxShadow: `0 10px 32px rgba(232,76,193,0.35), 0 0 0 1px ${C.accent}44`,
-      transition: `transform 0.2s ${EASE}`,
-    }}
-    onTouchStart={e => e.currentTarget.style.transform = "scale(0.92)"}
-    onTouchEnd={e => e.currentTarget.style.transform = "scale(1)"}>
-      <Calculator size={22} strokeWidth={2.2} />
+      transition: `all 0.2s ${EASE}`,
+    }}>
+      <Icon size={16} color={enabled ? C.accent : "rgba(165,149,187,0.35)"} strokeWidth={2.2} />
     </button>
+  );
+  return (
+    <div style={{ position: "fixed", right: 16, top: 16, zIndex: 60, display: "flex", gap: 8 }}>
+      {btn(canUndo, onUndo, RotateCcw)}
+      {btn(canRedo, onRedo, RotateCw)}
+    </div>
   );
 }
 
@@ -1924,7 +2177,7 @@ function Sheet({ title, subtitle, onClose, children, accent, fullScreen, leftAct
   );
 }
 
-function Field({ label, value, onChange, placeholder, mono, type = "text", autoFocus }) {
+function Field({ label, value, onChange, placeholder, mono, type = "text", autoFocus, onBlur, onFocus }) {
   return (
     <div>
       <div style={{ fontSize: 10, color: C.muted, marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.14em", fontWeight: 700 }}>{label}</div>
@@ -1939,8 +2192,8 @@ function Field({ label, value, onChange, placeholder, mono, type = "text", autoF
           fontFamily: mono ? "'JetBrains Mono', monospace" : "inherit",
           transition: `border-color 0.2s ${EASE}`,
         }}
-        onFocus={e => e.target.style.borderColor = C.accent + "60"}
-        onBlur={e => e.target.style.borderColor = C.border}
+        onFocus={e => { e.target.style.borderColor = C.accent + "60"; if (onFocus) onFocus(); }}
+        onBlur={e => { e.target.style.borderColor = C.border; if (onBlur) onBlur(); }}
       />
     </div>
   );
@@ -2048,22 +2301,22 @@ function NewOpSheet({ onClose, onSave, clientHistory }) {
           )}
         </div>
 
-        <Field label="USDT" value={f.usdtAmount} onChange={v => set("usdtAmount", v)} placeholder="0,00" mono />
+        <Field label="USDT" value={f.usdtAmount} onChange={v => set("usdtAmount", v)} onFocus={() => setShowSuggest(false)} placeholder="0,00" mono />
 
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-          <Field label="TC Cliente" value={f.tcClient} onChange={v => set("tcClient", v)} placeholder="0" mono />
-          <Field label="TC OTC (opcional)" value={f.tcOtc} onChange={v => set("tcOtc", v)} placeholder="0" mono />
+          <Field label="TC Cliente" value={f.tcClient} onChange={v => set("tcClient", v)} onFocus={() => setShowSuggest(false)} placeholder="0" mono />
+          <Field label="TC OTC (opcional)" value={f.tcOtc} onChange={v => set("tcOtc", v)} onFocus={() => setShowSuggest(false)} placeholder="0" mono />
         </div>
 
         <div>
           <div style={{ fontSize: 10, color: C.muted, marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.14em", fontWeight: 700 }}>Banco</div>
-          <select value={f.bank} onChange={e => set("bank", e.target.value)}
+          <select value={f.bank} onChange={e => set("bank", e.target.value)} onFocus={() => setShowSuggest(false)}
             style={{ width: "100%", padding: "12px 14px", borderRadius: 11, background: "rgba(255,255,255,0.03)", border: `1px solid ${C.border}`, color: C.text, fontSize: 15 }}>
             {BANKS.map(b => <option key={b.id} value={b.id}>{b.label}</option>)}
           </select>
         </div>
 
-        <Field label="Exchange" value={f.exchange} onChange={v => set("exchange", v)} placeholder="Ej: Bybit, Cocos, Binance…" />
+        <Field label="Exchange" value={f.exchange} onChange={v => set("exchange", v)} onFocus={() => setShowSuggest(false)} placeholder="Ej: Bybit, Cocos, Binance…" />
 
         <div>
           <div style={{ fontSize: 10, color: C.muted, marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.14em", fontWeight: 700 }}>Notas (privadas)</div>
@@ -2108,7 +2361,7 @@ function NewOpSheet({ onClose, onSave, clientHistory }) {
 // ═══════════════════════════════════════════════════════════════════
 //  SHEET · OP DETAIL (edit any field, share, present, duplicate)
 // ═══════════════════════════════════════════════════════════════════
-function OpDetailSheet({ op, onClose, onAddTTs, onDelTT, onDelOp, onUpdate, onDuplicate, onPresent, notify }) {
+function OpDetailSheet({ op, onClose, onAddTTs, onDelTT, onDelOp, onUpdate, onPresent, notify }) {
   const [waMsg, setWaMsg] = useState("");
   const [parsing, setParsing] = useState(false);
   const [parseResult, setParseResult] = useState(null);
@@ -2149,7 +2402,7 @@ function OpDetailSheet({ op, onClose, onAddTTs, onDelTT, onDelOp, onUpdate, onDu
   };
 
   const startEdit = (field, value) => { setEditing(field); setEditValue(String(value ?? "")); };
-  const fieldLabels = { usdtAmount: "USDT", tcClient: "TC cliente", tcOtc: "TC OTC", bank: "Banco", exchange: "Exchange", date: "Fecha", client: "Cliente" };
+  const fieldLabels = { usdtAmount: "USDT", tcClient: "TC cliente", tcOtc: "TC OTC", bank: "Banco", exchange: "Exchange", date: "Fecha", time: "Hora", client: "Cliente" };
   const saveEdit = () => {
     if (!editing) return;
     let v = editValue;
@@ -2159,6 +2412,11 @@ function OpDetailSheet({ op, onClose, onAddTTs, onDelTT, onDelOp, onUpdate, onDu
       const m = String(v).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
       if (!m) { notify("Formato fecha: DD/MM/YYYY", { kind: "error" }); return; }
       v = `${m[1].padStart(2,"0")}/${m[2].padStart(2,"0")}/${m[3]}`;
+    }
+    if (editing === "time") {
+      const m = String(v).match(/^(\d{1,2}):(\d{2})$/);
+      if (!m || +m[1] > 23 || +m[2] > 59) { notify("Formato hora: HH:MM", { kind: "error" }); return; }
+      v = `${m[1].padStart(2,"0")}:${m[2]}`;
     }
     onUpdate(op.id, { [editing]: v });
     setEditing(null);
@@ -2217,6 +2475,8 @@ function OpDetailSheet({ op, onClose, onAddTTs, onDelTT, onDelOp, onUpdate, onDu
           editing={editing} editValue={editValue} setEditValue={setEditValue} onStart={() => startEdit("exchange", op.exchange)} onSave={saveEdit} onCancel={() => setEditing(null)} />
         <EditableField label="Fecha" field="date" value={op.date}
           editing={editing} editValue={editValue} setEditValue={setEditValue} onStart={() => startEdit("date", op.date)} onSave={saveEdit} onCancel={() => setEditing(null)} />
+        <EditableField label="Hora" field="time" value={op.time || "—"}
+          editing={editing} editValue={editValue} setEditValue={setEditValue} onStart={() => startEdit("time", op.time || "")} onSave={saveEdit} onCancel={() => setEditing(null)} />
         <EditableField label="Cliente" field="client" value={op.client}
           editing={editing} editValue={editValue} setEditValue={setEditValue} onStart={() => startEdit("client", op.client)} onSave={saveEdit} onCancel={() => setEditing(null)} />
       </div>
@@ -2253,7 +2513,6 @@ function OpDetailSheet({ op, onClose, onAddTTs, onDelTT, onDelOp, onUpdate, onDu
         <ActionBtn icon={Copy} label="Copiar" onClick={copyProgress} />
         <ActionBtn icon={Eye} label="Mostrar" onClick={onPresent} />
         <ActionBtn icon={FileText} label="Excel" onClick={exportClient} />
-        <ActionBtn icon={Copy} label="Duplicar" onClick={() => onDuplicate(op.id)} />
       </div>
 
       {/* Notes */}
@@ -3020,126 +3279,11 @@ function BigStat({ label, value, color, fullWidth }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  SHEET · CALCULADORA DE COMISIONES
-// ═══════════════════════════════════════════════════════════════════
-function CalcSheet({ onClose }) {
-  const [type, setType] = useState("compra");
-  const [tcLow, setTcLow] = useState("");
-  const [tcHigh, setTcHigh] = useState("");
-  const [usdtInput, setUsdtInput] = useState("");
-  const [bankOut, setBankOut] = useState("Ripio");
-  const [bankIn, setBankIn] = useState("Ripio");
-
-  const tc = T[type];
-  const lo = parseNum(tcLow), hi = parseNum(tcHigh), usdt = parseNum(usdtInput);
-
-  const bOut = BANKS.find(b => b.id === bankOut)?.comm || 0;
-  const bIn = BANKS.find(b => b.id === bankIn)?.comm || 0;
-
-  const valid = lo > 0 && hi > 0 && usdt > 0;
-
-  const calc = useMemo(() => {
-    if (!valid) return null;
-    const tcLowN = type === "compra" ? lo : hi;  // TC al que comprás USDT
-    const tcHighN = type === "compra" ? hi : lo; // TC al que vendés USDT
-    const grossSpread = ((hi - lo) / lo) * 100;
-    const arsGross = usdt * (hi - lo);
-    const binanceFee = usdt * tcLowN * BINANCE_FEE;
-    const bankOutFee = usdt * tcLowN * bOut;  // sale ARS
-    const bankInFee = usdt * tcHighN * bIn;   // entra ARS
-    const totalFee = binanceFee + bankOutFee + bankInFee;
-    const arsNet = arsGross - totalFee;
-    const netSpread = ((arsNet / (usdt * tcLowN)) * 100);
-    return { grossSpread, arsGross, binanceFee, bankOutFee, bankInFee, totalFee, arsNet, netSpread };
-  }, [valid, lo, hi, usdt, bOut, bIn, type]);
-
-  return (
-    <Sheet title="Calculadora" subtitle="Comisiones + Binance 0,16%" onClose={onClose} accent={C.accent2}>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 14 }}>
-        {["compra", "venta"].map(t => {
-          const tt = T[t]; const active = type === t;
-          return (
-            <button key={t} onClick={() => setType(t)} style={{
-              padding: "12px", borderRadius: 11, fontSize: 11, fontWeight: 800,
-              letterSpacing: "0.14em", textTransform: "uppercase",
-              background: active ? tt.dim : "transparent",
-              border: `1px solid ${active ? tt.border : C.border}`,
-              color: active ? tt.primary : C.muted, fontFamily: "inherit",
-              transition: `all 0.25s ${EASE}`,
-            }}>{tt.label}</button>
-          );
-        })}
-      </div>
-
-      <div style={{ display: "flex", flexDirection: "column", gap: 11 }}>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-          <Field label="TC bajo" value={tcLow} onChange={setTcLow} placeholder="0" mono />
-          <Field label="TC alto" value={tcHigh} onChange={setTcHigh} placeholder="0" mono />
-        </div>
-        <Field label="USDT" value={usdtInput} onChange={setUsdtInput} placeholder="0,00" mono />
-
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-          <BankSelect label="Banco envío" value={bankOut} onChange={setBankOut} />
-          <BankSelect label="Banco recibo" value={bankIn} onChange={setBankIn} />
-        </div>
-
-        {/* Result */}
-        {calc && (
-          <div style={{
-            background: calc.arsNet >= 0 ? C.positiveDim : C.negativeDim,
-            border: `1px solid ${calc.arsNet >= 0 ? C.positiveBorder : C.negativeBorder}`,
-            borderRadius: 14, padding: "16px 18px", marginTop: 8,
-            backdropFilter: "blur(16px)", animation: "fadeUp 0.3s ease",
-          }}>
-            <div style={{ fontSize: 10, color: calc.arsNet >= 0 ? C.positive : C.negative, textTransform: "uppercase", letterSpacing: "0.18em", marginBottom: 8, fontWeight: 800 }}>
-              Ganancia neta
-            </div>
-            <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 26, fontWeight: 700, color: calc.arsNet >= 0 ? C.positive : C.negative, marginBottom: 4 }}>
-              {fmtARS(calc.arsNet)}
-            </div>
-            <div style={{ fontSize: 11, color: C.soft, marginBottom: 14 }}>
-              Spread neto: <span style={{ fontFamily: "'JetBrains Mono', monospace", color: calc.netSpread >= 0 ? C.positive : C.negative }}>{fmtPct(calc.netSpread)}</span>
-              {" · "}
-              Bruto: <span style={{ fontFamily: "'JetBrains Mono', monospace", color: C.textDim }}>{fmtPct(calc.grossSpread)}</span>
-            </div>
-            <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 12, fontSize: 12 }}>
-              <CalcRow label="Spread bruto ARS" value={fmtARS(calc.arsGross)} />
-              <CalcRow label="− Binance 0,16%" value={`−${fmtARS(calc.binanceFee)}`} dim />
-              {bOut > 0 && <CalcRow label={`− ${bankOut} ${(bOut * 100).toFixed(2).replace(".", ",")}%`} value={`−${fmtARS(calc.bankOutFee)}`} dim />}
-              {bIn > 0 && <CalcRow label={`− ${bankIn} ${(bIn * 100).toFixed(2).replace(".", ",")}%`} value={`−${fmtARS(calc.bankInFee)}`} dim />}
-            </div>
-          </div>
-        )}
-      </div>
-    </Sheet>
-  );
-}
-function BankSelect({ label, value, onChange }) {
-  return (
-    <div>
-      <div style={{ fontSize: 10, color: C.muted, marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.14em", fontWeight: 700 }}>{label}</div>
-      <select value={value} onChange={e => onChange(e.target.value)}
-        style={{ width: "100%", padding: "12px 14px", borderRadius: 11, background: "rgba(255,255,255,0.03)", border: `1px solid ${C.border}`, color: C.text, fontSize: 14, fontFamily: "inherit" }}>
-        {BANKS.map(b => <option key={b.id} value={b.id}>{b.label}</option>)}
-      </select>
-    </div>
-  );
-}
-function CalcRow({ label, value, dim }) {
-  return (
-    <div style={{ display: "flex", justifyContent: "space-between", padding: "4px 0", fontSize: 12 }}>
-      <span style={{ color: dim ? C.muted : C.soft }}>{label}</span>
-      <span style={{ fontFamily: "'JetBrains Mono', monospace", color: dim ? C.muted : C.text, fontWeight: 600 }}>{value}</span>
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════
 //  SHEET · SETTINGS / BACKUP
 // ═══════════════════════════════════════════════════════════════════
 function SettingsSheet({ ops, prefs, onClose, onImport, notify }) {
   const fileInput = useRef(null);
-  const [driveStatus, setDriveStatus] = useState({ connected: driveSync.isConnected(), lastSync: driveSync.getLastSync() });
+  const [driveStatus, setDriveStatus] = useState({ connected: driveSync.isConnected(), needsReconnect: driveSync.getNeedsReconnect(), lastSync: driveSync.getLastSync() });
   const alasiaMonths = useMemo(() => availableMonths(ops), [ops]);
   const [alasiaMonth, setAlasiaMonth] = useState(alasiaMonths[0] || todayStr().slice(3));
   const doAlasiaExport = () => {
@@ -3176,6 +3320,10 @@ function SettingsSheet({ ops, prefs, onClose, onImport, notify }) {
   };
 
   const handleDriveConnect = async () => {
+    if (driveStatus.connected && driveStatus.needsReconnect) {
+      await driveSync.connect();
+      return;
+    }
     if (driveStatus.connected) {
       if (!confirm("Desconectar Drive? Tus datos locales no se borran.")) return;
       driveSync.disconnect();
@@ -3190,37 +3338,52 @@ function SettingsSheet({ ops, prefs, onClose, onImport, notify }) {
     notify("✓ Sincronizado con Drive");
   };
 
-  const lastSyncStr = driveStatus.lastSync ? new Date(driveStatus.lastSync).toLocaleString("es-AR", { dateStyle: "short", timeStyle: "short" }) : null;
+  const agoStr = (iso) => {
+    if (!iso) return null;
+    const diff = Date.now() - new Date(iso).getTime();
+    const min = Math.floor(diff / 60000);
+    if (min < 1) return "hace instantes";
+    if (min < 60) return `hace ${min} min`;
+    const h = Math.floor(min / 60);
+    if (h < 24) return `hace ${h} h`;
+    const d = Math.floor(h / 24);
+    return `hace ${d} día${d !== 1 ? "s" : ""}`;
+  };
+  const lastSyncStr = driveStatus.lastSync ? agoStr(driveStatus.lastSync) : null;
+  const needsReconnect = driveStatus.connected && driveStatus.needsReconnect;
 
   return (
     <Sheet title="Más" subtitle="Drive, backup, info" onClose={onClose}>
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
         {/* Google Drive */}
         <div style={{
-          background: driveStatus.connected ? C.positiveDim : C.accentDim,
-          border: `1px solid ${driveStatus.connected ? C.positiveBorder : C.accent + "44"}`,
+          background: needsReconnect ? C.warnDim : driveStatus.connected ? C.positiveDim : C.accentDim,
+          border: `1px solid ${needsReconnect ? C.warn + "66" : driveStatus.connected ? C.positiveBorder : C.accent + "44"}`,
           borderRadius: 13, padding: "14px 16px",
         }}>
           <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
-            <div style={{ width: 38, height: 38, borderRadius: 11, background: driveStatus.connected ? C.positiveBorder : C.accentDim, display: "flex", alignItems: "center", justifyContent: "center" }}>
-              <Database size={18} color={driveStatus.connected ? C.positive : C.accent} />
+            <div style={{ width: 38, height: 38, borderRadius: 11, background: needsReconnect ? C.warnDim : driveStatus.connected ? C.positiveBorder : C.accentDim, display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <Database size={18} color={needsReconnect ? C.warn : driveStatus.connected ? C.positive : C.accent} />
             </div>
             <div style={{ flex: 1 }}>
               <div style={{ fontSize: 14, fontWeight: 700, color: C.text }}>Google Drive</div>
-              <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>
-                {driveStatus.syncing ? "Sincronizando..." : driveStatus.connected ? (lastSyncStr ? `Última: ${lastSyncStr}` : "Conectado") : "No conectado"}
+              <div style={{ fontSize: 11, color: needsReconnect ? C.warn : C.muted, marginTop: 2 }}>
+                {driveStatus.syncing ? "Sincronizando…"
+                  : needsReconnect ? "Sesión vencida — tocá Reconectar"
+                  : driveStatus.connected ? (lastSyncStr ? `Último backup ${lastSyncStr}` : "Conectado")
+                  : "No conectado"}
               </div>
             </div>
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: driveStatus.connected ? "1fr 1fr" : "1fr", gap: 6 }}>
+          <div style={{ display: "grid", gridTemplateColumns: driveStatus.connected && !needsReconnect ? "1fr 1fr" : "1fr", gap: 6 }}>
             <button onClick={handleDriveConnect} style={{
               padding: "10px", borderRadius: 9,
-              background: driveStatus.connected ? "rgba(255,255,255,0.05)" : C.accent,
-              border: `1px solid ${driveStatus.connected ? C.border : C.accent}`,
-              color: driveStatus.connected ? C.soft : C.bg,
+              background: needsReconnect ? C.warn : driveStatus.connected ? "rgba(255,255,255,0.05)" : C.accent,
+              border: `1px solid ${needsReconnect ? C.warn : driveStatus.connected ? C.border : C.accent}`,
+              color: needsReconnect ? C.bg : driveStatus.connected ? C.soft : C.bg,
               fontSize: 10, fontWeight: 800, letterSpacing: "0.12em", textTransform: "uppercase", fontFamily: "inherit",
-            }}>{driveStatus.connected ? "Desconectar" : "Conectar Drive"}</button>
-            {driveStatus.connected && (
+            }}>{needsReconnect ? "Reconectar Drive" : driveStatus.connected ? "Desconectar" : "Conectar Drive"}</button>
+            {driveStatus.connected && !needsReconnect && (
               <button onClick={handleSyncNow} style={{
                 padding: "10px", borderRadius: 9,
                 background: C.positiveDim, border: `1px solid ${C.positiveBorder}`,
