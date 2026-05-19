@@ -62,22 +62,106 @@ const dateToTime = ds => { const [dd, mm, yyyy] = ds.split("/"); return new Date
 const timeToMin = t => { if (!t) return 0; const [h, m] = String(t).split(":"); return (+h || 0) * 60 + (+m || 0); };
 const dateMonthKey = ds => ds.slice(3);
 
+// ═══════════════════════════════════════════════════════════════════
+//  opSettlement · FUNCIÓN CENTRAL DE SALDO (única fuente de verdad)
+// ═══════════════════════════════════════════════════════════════════
+// REGLA DE PLATA:
+//  COMPRA: enviado < total -> YO LE DEBO -> "A FAVOR cliente" (CIAN)
+//          enviado > total -> CLIENTE ME DEBE el exceso -> "ME DEBE" (ROJO)
+//  VENTA : recibido < total -> CLIENTE ME DEBE -> "ME DEBE" (ROJO)
+//          recibido > total -> YO LE DEBO -> "A FAVOR cliente" (CIAN)
+// CÍRCULO: incompleta -> CIAN con % real ; exacta -> CIAN 100% ; exceso -> ROJO 100%
+const opSettlement = (op) => {
+  const total = (op.usdtAmount || 0) * (op.tcClient || 0);
+  const moved = (op.tts || []).reduce((s, t) => s + (t.amount || 0), 0);
+  const pctRaw = total > 0 ? (moved / total) * 100 : 0;
+  const isCompra = op.type === "compra";
+  const diff = total - moved;            // >0 incompleta ; <0 exceso
+  const abs = Math.abs(diff);
+  const settledByDiff = abs < 1;
+  const manualClosed = !!op.manualClosed;
+  const done = manualClosed || settledByDiff;
 
-// Calcular saldo acumulado por cliente (excluye saldadas y manualClosed)
+  let state;
+  if (done && !manualClosed) state = "exact";
+  else if (diff > 0) state = "incomplete";
+  else if (diff < 0) state = "excess";
+  else state = "exact";
+
+  let favor; // "client" (CIAN) | "me" (ROJO) | "none"
+  if (done) favor = "none";
+  else if (isCompra) favor = diff > 0 ? "client" : "me";
+  else favor = diff > 0 ? "me" : "client";
+
+  let circleColor, circlePct, color, label, amount = abs;
+  if (done) {
+    circleColor = C.accent2; circlePct = 100;
+    color = (T[op.type] || T.compra).primary;
+    label = manualClosed ? "SALDADA" : "COMPLETA";
+    amount = 0;
+  } else if (state === "incomplete") {
+    circleColor = C.accent2;
+    circlePct = Math.max(0, Math.min(100, pctRaw));
+    if (favor === "client") { color = C.accent2; label = "A FAVOR"; }
+    else { color = C.negative; label = "ME DEBE"; }
+  } else {
+    circleColor = C.negative; circlePct = 100;
+    if (favor === "client") { color = C.accent2; label = "A FAVOR"; }
+    else { color = C.negative; label = "ME DEBE"; }
+  }
+
+  return {
+    total, moved, diff, abs, amount,
+    pct: Math.max(0, Math.min(100, pctRaw)), pctRaw,
+    done, manualClosed, state, favor,
+    circleColor, circlePct, color, label, isCompra,
+  };
+};
+
+const settlementLine = (op) => {
+  const s = opSettlement(op);
+  if (s.done) return s.manualClosed ? "Saldada ✓" : "Completa ✓";
+  if (s.favor === "client") return `A FAVOR ${op.client} ${fmtARS(s.abs)}`;
+  return `${op.client} ME DEBE ${fmtARS(s.abs)}`;
+};
+
+// ═══════════════════════════════════════════════════════════════════
+//  GANANCIA · bruta / neta (comisión % MANUAL por op, 0-100)
+// ═══════════════════════════════════════════════════════════════════
+// Bruta COMPRA = (tcOtc - tcClient) * USDT ; Bruta VENTA = (tcClient - tcOtc) * USDT
+// Comisión$ = USDT * tcCliente * com%/100 ; Neta = bruta - comisión$ ; NetaUSDT = neta / tcOtc
+// Spread % SIEMPRE positivo.
+const opProfit = (op) => {
+  if (!op.tcOtc) return null;
+  const usdt = op.usdtAmount || 0;
+  const tcCli = op.tcClient || 0;
+  const tcOtc = op.tcOtc || 0;
+  const grossPerUnit = op.type === "compra" ? (tcOtc - tcCli) : (tcCli - tcOtc);
+  const gross = grossPerUnit * usdt;
+  const comPct = Math.max(0, Math.min(100, op.commPct ?? 0));
+  const comAr = usdt * tcCli * comPct / 100;
+  const net = gross - comAr;
+  const grossUsdt = tcOtc ? gross / tcOtc : 0;
+  const netUsdt = tcOtc ? net / tcOtc : 0;
+  const spread = tcOtc ? Math.abs((tcCli - tcOtc) / tcOtc) * 100 : 0;
+  return { gross, grossUsdt, comPct, comAr, net, netUsdt, spread };
+};
+
+// Saldo acumulado por cliente (excluye saldadas/manualClosed/ocultas)
 const calcClientBalances = (ops) => {
   const map = {};
   ops.forEach(op => {
-    if (op.manualClosed || op.hidden) return; // Excluir saldadas manualmente y ocultas
-    const total = op.usdtAmount * op.tcClient;
-    const sent = op.tts.reduce((s, t) => s + t.amount, 0);
-    const diff = total - sent;
-    if (Math.abs(diff) < 1) return; // Excluir saldadas automáticamente
+    if (op.manualClosed || op.hidden) return;
+    const s = opSettlement(op);
+    if (s.done) return;
     if (!map[op.client]) map[op.client] = { client: op.client, balance: 0, ops: [] };
-    // balance positivo = cliente me debe pesos
-    map[op.client].balance += diff;
+    const signed = s.favor === "me" ? s.abs : -s.abs; // + => me deben ; - => a favor cliente
+    map[op.client].balance += signed;
     map[op.client].ops.push({
-      id: op.id, date: op.date, diff, type: op.type,
-      usdt: op.usdtAmount, tc: op.tcClient, sent, total, pending: diff,
+      id: op.id, date: op.date, type: op.type,
+      usdt: op.usdtAmount, tc: op.tcClient,
+      sent: s.moved, total: s.total,
+      pending: s.abs, favor: s.favor, signed,
     });
   });
   return Object.values(map)
@@ -86,7 +170,6 @@ const calcClientBalances = (ops) => {
     .sort((a, b) => Math.abs(b.balance) - Math.abs(a.balance));
 };
 
-// Available months from ops
 const availableMonths = ops => {
   const set = new Set(ops.map(o => o.date.slice(3)));
   return [...set].sort((a, b) => {
@@ -124,6 +207,7 @@ const KEY_CLIENT_NOTES = "plexo-client-notes-v1";
 const loadClientNotes = () => { try { return JSON.parse(localStorage.getItem(KEY_CLIENT_NOTES) || "{}"); } catch { return {}; } };
 const saveClientNotes = (n) => { try { localStorage.setItem(KEY_CLIENT_NOTES, JSON.stringify(n)); } catch {} };
 
+
 // Storage: localStorage + auto-sync Drive
 const loadOps = async () => {
   try {
@@ -146,6 +230,7 @@ const loadPrefs = async () => {
   catch { return {}; }
 };
 const savePrefs = async p => { try { localStorage.setItem(KEY_PREFS, JSON.stringify(p)); } catch {} };
+
 
 // ─── GOOGLE DRIVE SYNC ───
 const driveSync = (() => {
@@ -172,7 +257,6 @@ const driveSync = (() => {
   const scheduleProactiveRefresh = () => {
     clearTimeout(refreshTimer);
     if (!accessToken || !tokenExpiry) return;
-    // Renovar 5 min antes de expirar, mientras la app esté abierta
     const ms = Math.max(10000, tokenExpiry - Date.now() - 5 * 60 * 1000);
     refreshTimer = setTimeout(() => { refreshToken(true); }, ms);
   };
@@ -185,7 +269,6 @@ const driveSync = (() => {
         callback: (resp) => {
           if (resp.access_token) {
             accessToken = resp.access_token;
-            // GIS tokens duran ~3600s
             const ttl = (resp.expires_in ? +resp.expires_in : 3600) * 1000;
             tokenExpiry = Date.now() + ttl;
             needsReconnect = false;
@@ -214,7 +297,6 @@ const driveSync = (() => {
     }
   });
 
-  // Renovación silenciosa: prompt:'' no muestra popup si la sesión de Google sigue activa
   const refreshToken = async (silent) => {
     const ok = await init();
     if (!ok || !tokenClient) return false;
@@ -252,7 +334,6 @@ const driveSync = (() => {
   const getNeedsReconnect = () => needsReconnect;
 
   const apiCall = async (url, options = {}, _retried) => {
-    // Si el token está vencido o por vencer, intentar refresh silencioso primero
     if (accessToken && tokenExpiry && Date.now() > tokenExpiry - 60000 && !_retried) {
       await refreshToken(true);
     }
@@ -362,10 +443,10 @@ const driveSync = (() => {
     clearTimeout(queueTimer);
     queueTimer = setTimeout(() => syncNow(data), 3000);
   };
-  // Al cargar: si hay token guardado, programar refresh proactivo
   if (accessToken && tokenExpiry) scheduleProactiveRefresh();
   return { init, connect, disconnect, isConnected, syncNow, queueSync, onStatus, refreshToken, getNeedsReconnect, getLastSync: () => localStorage.getItem("plexo-drive-lastsync") };
 })();
+
 
 // ═══════════════════════════════════════════════════════════════════
 //  WHATSAPP PARSER (con detección de ambigüedades)
@@ -379,12 +460,14 @@ const parseLocal = (msg) => {
   const collected = [];
   const seenRanges = [];
 
+
   // Helper: rechazar si hay dígitos pegados antes o después del número detectado
   const hasStuckDigits = (msg, startIdx, endIdx) => {
     const before = startIdx > 0 ? msg[startIdx - 1] : "";
     const after = endIdx < msg.length ? msg[endIdx] : "";
     return /\d/.test(before) || /\d/.test(after);
   };
+
 
   // PASADA 1: $ obligatorio
   const re1 = /\$\s*(\d{4,9}(?:,\d{1,2})?|\d{1,3}(?:\.\d{3}){0,2}(?:,\d{1,2})?)(?:\.?-)?/g;
@@ -405,6 +488,7 @@ const parseLocal = (msg) => {
     seenRanges.push({ start: m.index, end: m.index + m[0].length });
   }
 
+
   // PASADA 2: keywords MONTO/IMPORTE/VALOR sin requerir $
   const re2 = /\b(monto|importe|valor)\s*[:=]?\s*\$?\s*(\d{4,9}(?:,\d{1,2})?|\d{1,3}(?:\.\d{3}){0,2}(?:,\d{1,2})?)(?:\.?-)?/gi;
   while ((m = re2.exec(msg)) !== null) {
@@ -423,6 +507,7 @@ const parseLocal = (msg) => {
     collected.push({ value: Math.round(value), idx: numStart });
     seenRanges.push({ start: m.index, end: m.index + m[0].length });
   }
+
 
   // PASADA 3: montos solos en una línea (sin texto alrededor, sin $)
   // Una línea = entre saltos de línea, que contiene SOLO un número formateado
@@ -459,8 +544,10 @@ const parseLocal = (msg) => {
     lineOffset += line.length + 1; // +1 por el \n
   }
 
+
   // Ordenar por posición en el texto
   collected.sort((a, b) => a.idx - b.idx);
+
 
   // Warnings: CBU/CUIT/Alias cerca del monto
   const suspKeywords = /\b(cbu|cuit|cuil|alias|n[°º]\s*de\s*cuenta|cuenta:|titular)\b/i;
@@ -474,13 +561,16 @@ const parseLocal = (msg) => {
     amounts.push(value);
   });
 
+
   if (/\b(usd|usdt|d[oó]lar)\b/i.test(msg) && amounts.length > 0) {
     warnings.push("Detecté mención de USD/USDT — verificá que sea ARS");
   }
 
+
   const uniqueWarnings = [...new Set(warnings)].slice(0, 3);
   return { amounts, warnings: uniqueWarnings };
 };
+
 
 // Parser IA como fallback (solo si local no encuentra nada y hay tokens disponibles)
 const parseAI = async (msg) => {
@@ -509,18 +599,22 @@ const parseAI = async (msg) => {
   } catch { return null; }
 };
 
+
 const parseWhatsApp = async (msg) => {
   // 1) Intentar parser local primero
   const local = parseLocal(msg);
   if (local.amounts.length > 0) return local;
 
+
   // 2) Si local no encuentra nada, intentar IA como fallback
   const ai = await parseAI(msg);
   if (ai && ai.amounts.length > 0) return ai;
 
+
   // 3) Nada funcionó
   return { amounts: [], warnings: ["No se detectaron montos válidos en el mensaje"] };
 };
+
 
 // ═══════════════════════════════════════════════════════════════════
 //  EXCEL · FORMATO ALASIA
@@ -528,6 +622,7 @@ const parseWhatsApp = async (msg) => {
 const exportAlasiaXLSX = (ops, monthKey) => {
   const monthOps = ops.filter(o => dateMonthKey(o.date) === monthKey);
   if (!monthOps.length) return false;
+
 
   const compraRows = [], ventaRows = [];
   const sortByDate = (a, b) => dateToTime(a.date) - dateToTime(b.date);
@@ -539,6 +634,7 @@ const exportAlasiaXLSX = (ops, monthKey) => {
       else ventaRows.push(row);
     });
   });
+
 
   // Header rows
   const aoa = [
@@ -553,12 +649,14 @@ const exportAlasiaXLSX = (ops, monthKey) => {
     aoa.push([...c, ...v]);
   }
 
+
   const ws = XLSX.utils.aoa_to_sheet(aoa);
   ws["!merges"] = [
     { s: { r: 0, c: 0 }, e: { r: 0, c: 6 } },
     { s: { r: 0, c: 7 }, e: { r: 0, c: 13 } },
   ];
   ws["!cols"] = Array(14).fill({ wch: 14 });
+
 
   // Format date cells as text DD/MM/YYYY
   for (let r = 2; r < aoa.length; r++) {
@@ -576,6 +674,7 @@ const exportAlasiaXLSX = (ops, monthKey) => {
     });
   }
 
+
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, "Operaciones");
   const [mm, yyyy] = monthKey.split("/");
@@ -583,11 +682,11 @@ const exportAlasiaXLSX = (ops, monthKey) => {
   return true;
 };
 
+
+
 // Excel para enviar a un cliente con su op
 const exportClientXLSX = (op) => {
-  const total = op.usdtAmount * op.tcClient;
-  const sent = op.tts.reduce((s, t) => s + t.amount, 0);
-  const remaining = total - sent;
+  const s = opSettlement(op);
   const rows = [
     [`Operación · ${op.client}`],
     [],
@@ -595,14 +694,14 @@ const exportClientXLSX = (op) => {
     ["Tipo", op.type === "compra" ? "Compra USDT" : "Venta USDT"],
     ["USDT", op.usdtAmount],
     ["Tipo de cambio", op.tcClient],
-    ["Total ARS", total],
+    ["Total ARS", s.total],
     [],
-    ["Transferencias enviadas"],
+    ["Transferencias"],
     ["#", "Monto ARS"],
     ...op.tts.map((tt, i) => [i + 1, tt.amount]),
     [],
-    ["Total enviado", sent],
-    [remaining > 0 ? "Pendiente" : remaining < 0 ? "Sobrante" : "Saldado", Math.abs(remaining)],
+    ["Total movido", s.moved],
+    [s.done ? "Saldada" : s.favor === "me" ? "Cliente me debe" : "A favor cliente", s.done ? 0 : s.abs],
   ];
   const ws = XLSX.utils.aoa_to_sheet(rows);
   ws["!cols"] = [{ wch: 22 }, { wch: 18 }];
@@ -649,10 +748,10 @@ function AtomLogo({ size = 32, animated = false }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  TOAST SYSTEM
+//  TOAST SYSTEM (soporta acción "Ver" + deshacer)
 // ═══════════════════════════════════════════════════════════════════
 function Toast({ toast, onDismiss }) {
-  useEffect(() => { const t = setTimeout(onDismiss, toast.undo ? 6000 : 3500); return () => clearTimeout(t); }, [toast.id]); // eslint-disable-line
+  useEffect(() => { const t = setTimeout(onDismiss, (toast.undo || toast.action) ? 6000 : 3500); return () => clearTimeout(t); }, [toast.id]); // eslint-disable-line
   const color = toast.kind === "error" ? C.negative : toast.kind === "warn" ? C.warn : C.positive;
   const Icon = toast.kind === "error" ? AlertCircle : toast.kind === "warn" ? AlertCircle : CheckCircle2;
   return (
@@ -666,6 +765,14 @@ function Toast({ toast, onDismiss }) {
     }}>
       <Icon size={16} color={color} />
       <span style={{ flex: 1, color: C.text, fontSize: 13, fontWeight: 500 }}>{toast.message}</span>
+      {toast.action && (
+        <button onClick={() => { toast.action.onClick(); onDismiss(); }}
+          style={{ background: "transparent", border: `1px solid ${C.accent2}55`, color: C.accent2, fontFamily: "inherit",
+            fontSize: 11, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase",
+            padding: "5px 10px", borderRadius: 8, cursor: "pointer" }}>
+          {toast.action.label || "Ver"}
+        </button>
+      )}
       {toast.undo && (
         <button onClick={() => { toast.undo(); onDismiss(); }}
           style={{ background: "transparent", border: `1px solid ${C.accent}40`, color: C.accent, fontFamily: "inherit",
@@ -690,19 +797,33 @@ export default function App() {
   const [toast, setToast] = useState(null);
 
   // ── Undo/Redo basado en snapshots (hasta 50) ──
-  const history = useRef([]);      // array de snapshots de ops
-  const histIndex = useRef(-1);    // posición actual en history
+  const history = useRef([]);
+  const histIndex = useRef(-1);
   const isTimeTravel = useRef(false);
-  const [histVer, setHistVer] = useState(0); // fuerza re-render de los botones
-
+  const [histVer, setHistVer] = useState(0);
   const HIST_MAX = 50;
 
-  // setOps que registra snapshot en el historial
+  // Detectar qué cliente cambió entre dos snapshots (para el toast "Ver")
+  const diffClient = (before, after) => {
+    try {
+      const mapB = new Map((before || []).map(o => [o.id, o]));
+      const mapA = new Map((after || []).map(o => [o.id, o]));
+      for (const [id, opA] of mapA) {
+        const opB = mapB.get(id);
+        if (!opB) return { client: opA.client, id };
+        if (JSON.stringify(opB) !== JSON.stringify(opA)) return { client: opA.client, id };
+      }
+      for (const [id, opB] of mapB) {
+        if (!mapA.has(id)) return { client: opB.client, id: null };
+      }
+    } catch {}
+    return null;
+  };
+
   const setOps = useCallback((updater) => {
     setOpsRaw(prev => {
       const next = typeof updater === "function" ? updater(prev) : updater;
       if (!isTimeTravel.current) {
-        // Cortar cualquier "redo" futuro
         if (histIndex.current < history.current.length - 1) {
           history.current = history.current.slice(0, histIndex.current + 1);
         }
@@ -718,28 +839,48 @@ export default function App() {
   const canUndo = histIndex.current > 0;
   const canRedo = histIndex.current < history.current.length - 1;
 
+  const notifyRef = useRef(null);
+  const navigateToOpRef = useRef(null);
+
   const doUndo = useCallback(() => {
     if (histIndex.current <= 0) return;
+    const before = history.current[histIndex.current];
     histIndex.current -= 1;
+    const after = history.current[histIndex.current];
     isTimeTravel.current = true;
-    setOpsRaw(JSON.parse(JSON.stringify(history.current[histIndex.current])));
+    setOpsRaw(JSON.parse(JSON.stringify(after)));
     setHistVer(v => v + 1);
     setTimeout(() => { isTimeTravel.current = false; }, 0);
+    const ch = diffClient(after, before);
+    if (notifyRef.current) {
+      notifyRef.current(
+        ch ? `Deshecho: cambio en ${ch.client}` : "Cambio deshecho",
+        ch && ch.id ? { action: { label: "Ver", onClick: () => navigateToOpRef.current && navigateToOpRef.current(ch.id) } } : {}
+      );
+    }
   }, []);
 
   const doRedo = useCallback(() => {
     if (histIndex.current >= history.current.length - 1) return;
+    const before = history.current[histIndex.current];
     histIndex.current += 1;
+    const after = history.current[histIndex.current];
     isTimeTravel.current = true;
-    setOpsRaw(JSON.parse(JSON.stringify(history.current[histIndex.current])));
+    setOpsRaw(JSON.parse(JSON.stringify(after)));
     setHistVer(v => v + 1);
     setTimeout(() => { isTimeTravel.current = false; }, 0);
+    const ch = diffClient(before, after);
+    if (notifyRef.current) {
+      notifyRef.current(
+        ch ? `Rehecho: cambio en ${ch.client}` : "Cambio rehecho",
+        ch && ch.id ? { action: { label: "Ver", onClick: () => navigateToOpRef.current && navigateToOpRef.current(ch.id) } } : {}
+      );
+    }
   }, []);
 
   useEffect(() => {
     Promise.all([loadOps(), loadPrefs()]).then(([o, p]) => {
       setOpsRaw(o); setPrefs(p); setReady(true);
-      // Snapshot inicial
       history.current = [JSON.parse(JSON.stringify(o))];
       histIndex.current = 0;
     });
@@ -749,34 +890,28 @@ export default function App() {
   useEffect(() => { if (ready) savePrefs(prefs); }, [prefs, ready]);
 
   // ── Navegación con botón atrás del celular ──
-  // Stack de restore: cada acción de navegación pushea una función de "volver"
   const navStack = useRef([]);
   const isPopping = useRef(false);
   const prevSheetRef = useRef(null);
   const prevTabRef = useRef("inicio");
 
-  // Trackear cambios de sheet
   useEffect(() => {
     if (isPopping.current) { prevSheetRef.current = sheet; return; }
     const prev = prevSheetRef.current;
     const curr = sheet;
     if (!prev && curr) {
-      // Apertura nueva
       navStack.current.push(() => setSheet(null));
       try { window.history.pushState({ plexo: navStack.current.length }, ""); } catch {}
     } else if (prev && curr && (prev.kind !== curr.kind || prev.id !== curr.id)) {
-      // Cambio entre sheets (ej: detail → present)
       const captured = prev;
       navStack.current.push(() => setSheet(captured));
       try { window.history.pushState({ plexo: navStack.current.length }, ""); } catch {}
     } else if (prev && !curr && !isPopping.current) {
-      // Cierre manual (botón X) → consumir el history para mantener balance
       try { window.history.back(); } catch {}
     }
     prevSheetRef.current = sheet;
   }, [sheet]);
 
-  // Trackear cambios de tab
   useEffect(() => {
     if (isPopping.current) { prevTabRef.current = tab; return; }
     const prev = prevTabRef.current;
@@ -787,19 +922,16 @@ export default function App() {
     prevTabRef.current = tab;
   }, [tab]);
 
-  // Listener del botón atrás del celular (popstate)
   useEffect(() => {
     const handler = () => {
       if (navStack.current.length > 0) {
         const restore = navStack.current.pop();
         isPopping.current = true;
         try { restore(); } catch {}
-        // Reset el flag en el siguiente tick para que los useEffect de tracking no re-pusheen
         setTimeout(() => { isPopping.current = false; }, 50);
       }
     };
     window.addEventListener("popstate", handler);
-    // Estado inicial: marcar la "raíz" para que el primer atrás físico tenga algo que consumir
     try {
       if (!window.history.state || window.history.state.plexo === undefined) {
         window.history.replaceState({ plexo: 0 }, "");
@@ -810,11 +942,19 @@ export default function App() {
 
   // ── Toast helpers ──
   const notify = useCallback((message, opts = {}) => {
-    setToast({ id: uid(), message, kind: opts.kind || "success", undo: opts.undo });
+    setToast({ id: uid(), message, kind: opts.kind || "success", undo: opts.undo, action: opts.action });
   }, []);
   const dismissToast = useCallback(() => setToast(null), []);
 
-  // ── State actions (undo/redo via snapshots) ──
+  const navigateToOp = useCallback((opId) => {
+    setTab("inicio");
+    setSheet({ kind: "detail", id: opId });
+  }, []);
+
+  useEffect(() => { notifyRef.current = notify; }, [notify]);
+  useEffect(() => { navigateToOpRef.current = navigateToOp; }, [navigateToOp]);
+
+  // ── State actions ──
   const addOp = useCallback((data) => {
     const now = new Date();
     const hhmm = `${String(now.getHours()).padStart(2,"0")}:${String(now.getMinutes()).padStart(2,"0")}`;
@@ -839,10 +979,8 @@ export default function App() {
   }, [setOps, notify]);
 
   const delTT = useCallback((opId, ttId) => {
-    let removed = null;
     setOps(p => p.map(o => {
       if (o.id !== opId) return o;
-      removed = o.tts.find(t => t.id === ttId);
       return { ...o, tts: o.tts.filter(t => t.id !== ttId) };
     }));
     notify(`TT eliminada`);
@@ -855,7 +993,6 @@ export default function App() {
     notify(`Operación de ${removed?.client || ""} eliminada`);
   }, [ops, setOps, notify]);
 
-  // Marcar saldada (manualClosed) — una op o todas las de un cliente
   const markClientSettled = useCallback((clientName) => {
     setOps(p => p.map(o => o.client === clientName ? { ...o, manualClosed: true } : o));
     notify(`✓ ${clientName} marcado como saldado`);
@@ -878,7 +1015,6 @@ export default function App() {
   const monthOps = useMemo(() => ops.filter(o => dateMonthKey(o.date) === currentMonth), [ops, currentMonth]);
   const months = useMemo(() => availableMonths(ops), [ops]);
 
-  // Client history for autocomplete
   const clientHistory = useMemo(() => {
     const map = {};
     [...ops].sort((a, b) => b.ts - a.ts).forEach(op => {
@@ -890,15 +1026,13 @@ export default function App() {
   const detailOp = sheet?.kind === "detail" ? ops.find(o => o.id === sheet.id) : null;
   const presentOp = sheet?.kind === "present" ? ops.find(o => o.id === sheet.id) : null;
 
-  // Total pending today
   const totalPendingToday = useMemo(() => todayOps.reduce((s, op) => {
     if (op.manualClosed || op.hidden) return s;
-    const tot = op.usdtAmount * op.tcClient;
-    const sent = op.tts.reduce((x, t) => x + t.amount, 0);
-    return s + Math.max(0, tot - sent);
+    const st = opSettlement(op);
+    if (st.done) return s;
+    return s + st.abs;
   }, 0), [todayOps]);
 
-  // Estado global de Drive (para banner de alerta)
   const [driveAlert, setDriveAlert] = useState(driveSync.isConnected() && driveSync.getNeedsReconnect());
   useEffect(() => {
     const unsub = driveSync.onStatus((s) => {
@@ -959,7 +1093,7 @@ export default function App() {
 
       <BottomNav tab={tab} onChange={setTab} onSettings={() => setSheet({ kind: "settings" })} />
 
-      {tab === "inicio" && <UndoFab canUndo={canUndo} canRedo={canRedo} onUndo={doUndo} onRedo={doRedo} />}
+      <UndoFab canUndo={canUndo} canRedo={canRedo} onUndo={doUndo} onRedo={doRedo} />
 
       {sheet?.kind === "new" && <NewOpSheet
         onClose={() => setSheet(null)} onSave={addOp}
@@ -1060,15 +1194,8 @@ function InicioScreen({ ops, today, onNew, onDetail, onPresent, onQuickAddTT, on
   const [search, setSearch] = useState("");
   const [showSearch, setShowSearch] = useState(false);
 
-  // Determinar si una op está "completa" (saldada manual o diferencia < $1)
-  const isComplete = (op) => {
-    if (op.manualClosed) return true;
-    const total = op.usdtAmount * op.tcClient;
-    const sent = op.tts.reduce((s, t) => s + t.amount, 0);
-    return Math.abs(total - sent) < 1;
-  };
+  const isComplete = (op) => opSettlement(op).done;
 
-  // Ordenador por fecha + hora (más reciente primero)
   const byDateTime = (a, b) => {
     const ta = dateToTime(a.date) + (a.time ? timeToMin(a.time) * 60000 : 0);
     const tb = dateToTime(b.date) + (b.time ? timeToMin(b.time) * 60000 : 0);
@@ -1076,7 +1203,6 @@ function InicioScreen({ ops, today, onNew, onDetail, onPresent, onQuickAddTT, on
     return (b.createdAt || 0) - (a.createdAt || 0);
   };
 
-  // Filtro de búsqueda (solo cliente — search inteligente)
   const filterFn = (op) => {
     if (!search.trim()) return true;
     const q = search.toLowerCase().trim();
@@ -1095,15 +1221,10 @@ function InicioScreen({ ops, today, onNew, onDetail, onPresent, onQuickAddTT, on
   const activas = ops.filter(o => !isComplete(o)).filter(filterFn).sort(byDateTime);
   const historial = ops.filter(o => isComplete(o)).filter(filterFn).sort(byDateTime);
 
-  // Agrupar historial por fecha
   const histByDate = historial.reduce((acc, o) => { (acc[o.date] = acc[o.date] || []).push(o); return acc; }, {});
   const histDates = Object.keys(histByDate).sort((a, b) => dateToTime(b) - dateToTime(a));
 
-  const totalPending = activas.reduce((s, op) => {
-    const tot = op.usdtAmount * op.tcClient;
-    const sent = op.tts.reduce((x, t) => x + t.amount, 0);
-    return s + Math.max(0, tot - sent);
-  }, 0);
+  const totalPending = activas.reduce((s, op) => s + opSettlement(op).abs, 0);
 
   const [dd, mm] = today.split("/");
 
@@ -1161,7 +1282,6 @@ function InicioScreen({ ops, today, onNew, onDetail, onPresent, onQuickAddTT, on
       <div style={{ padding: "0 16px" }}>
         <NewOpButton onClick={onNew} />
 
-        {/* OPERACIONES ACTIVAS */}
         <div style={{
           display: "flex", alignItems: "center", gap: 10, color: C.accent, fontSize: 11,
           fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.16em",
@@ -1187,7 +1307,6 @@ function InicioScreen({ ops, today, onNew, onDetail, onPresent, onQuickAddTT, on
           </div>
         )}
 
-        {/* HISTORIAL */}
         <button onClick={() => setShowHistory(h => !h)} style={{
           display: "flex", alignItems: "center", gap: 10, color: C.soft, fontSize: 11,
           fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.16em",
@@ -1248,7 +1367,7 @@ function NewOpButton({ onClick }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  OP CARD (con swipe + quick actions)
+//  OP CARD (con swipe + quick actions) — usa opSettlement
 // ═══════════════════════════════════════════════════════════════════
 function OpCard({ op, onClick, onQuickAddTT, onPresent, onDelete }) {
   const [swipeX, setSwipeX] = useState(0);
@@ -1256,13 +1375,10 @@ function OpCard({ op, onClick, onQuickAddTT, onPresent, onDelete }) {
   const [confirmDel, setConfirmDel] = useState(false);
   const tc = T[op.type];
 
-  const total = op.usdtAmount * op.tcClient;
-  const sent = op.tts.reduce((s, t) => s + t.amount, 0);
-  const remaining = total - sent;
-  const pct = total > 0 ? Math.min(100, Math.max(0, (sent / total) * 100)) : 0;
-  const done = op.manualClosed || Math.abs(remaining) < 1;
-  const overshoot = remaining < 0 && !done;
-  const nearComplete = !done && !overshoot && remaining > 0 && remaining < NEAR_COMPLETE;
+  const s = opSettlement(op);
+  const done = s.done;
+  const nearComplete = !done && s.state === "incomplete" && s.abs < NEAR_COMPLETE;
+  const isExcess = s.state === "excess" && !done;
 
   const onTouchStart = e => { setTouchStart(e.touches[0].clientX); setConfirmDel(false); };
   const onTouchMove = e => {
@@ -1292,15 +1408,13 @@ function OpCard({ op, onClick, onQuickAddTT, onPresent, onDelete }) {
 
   return (
     <div style={{ position: "relative", overflow: "hidden", borderRadius: 14 }}>
-      {/* Delete action revealed by swipe */}
       <div style={{
         position: "absolute", right: 0, top: 0, bottom: 0, width: 100,
         background: confirmDel ? C.negative : C.negativeDim,
         display: "flex", alignItems: "center", justifyContent: "center",
         gap: 6, color: confirmDel ? "#fff" : C.negative,
         fontSize: 11, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase",
-        transition: `background 0.2s ${EASE}`,
-        cursor: "pointer",
+        transition: `background 0.2s ${EASE}`, cursor: "pointer",
       }} onClick={handleDeleteClick}>
         <Trash2 size={15} />
         {confirmDel ? "Confirmar" : "Eliminar"}
@@ -1310,7 +1424,7 @@ function OpCard({ op, onClick, onQuickAddTT, onPresent, onDelete }) {
         onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}
         style={{
           background: C.card,
-          border: `1px solid ${done ? tc.border : nearComplete ? `${C.warn}44` : overshoot ? `${C.warn}66` : C.border}`,
+          border: `1px solid ${done ? tc.border : nearComplete ? `${C.warn}44` : isExcess ? `${C.negative}66` : C.border}`,
           borderRadius: 14, padding: "12px 14px",
           backdropFilter: "blur(20px)",
           boxShadow: done ? tc.glow : "0 2px 12px rgba(0,0,0,0.3)",
@@ -1329,7 +1443,7 @@ function OpCard({ op, onClick, onQuickAddTT, onPresent, onDelete }) {
                   {tc.label}
                 </span>
                 {nearComplete && <span style={{ fontSize: 8, fontWeight: 800, padding: "2px 6px", borderRadius: 4, background: C.warnDim, color: C.warn, letterSpacing: "0.1em" }}>CASI</span>}
-                {overshoot && <span style={{ fontSize: 8, fontWeight: 800, padding: "2px 6px", borderRadius: 4, background: C.warnDim, color: C.warn, letterSpacing: "0.1em" }}>+EXC</span>}
+                {isExcess && <span style={{ fontSize: 8, fontWeight: 800, padding: "2px 6px", borderRadius: 4, background: C.negativeDim, color: C.negative, letterSpacing: "0.1em" }}>+EXC</span>}
               </div>
               <div style={{ fontSize: 10, color: C.muted, fontFamily: "'JetBrains Mono', monospace", marginTop: 1 }}>
                 {op.date.slice(0, 5)}
@@ -1345,8 +1459,8 @@ function OpCard({ op, onClick, onQuickAddTT, onPresent, onDelete }) {
 
           <div style={{ height: 3, background: "rgba(255,255,255,0.04)", borderRadius: 2, marginBottom: 7, overflow: "hidden" }}>
             <div style={{
-              height: "100%", width: `${pct}%`,
-              background: `linear-gradient(90deg, ${tc.primary}66, ${tc.primary})`,
+              height: "100%", width: `${s.circlePct}%`,
+              background: `linear-gradient(90deg, ${s.circleColor}66, ${s.circleColor})`,
               borderRadius: 2, transition: `width 0.5s ${EASE}`,
             }} />
           </div>
@@ -1354,13 +1468,13 @@ function OpCard({ op, onClick, onQuickAddTT, onPresent, onDelete }) {
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 11 }}>
             {done ? (
               <span style={{ color: tc.primary, fontFamily: "'JetBrains Mono', monospace", fontWeight: 700 }}>✓ Completo</span>
-            ) : remaining > 0 ? (
+            ) : s.favor === "me" ? (
               <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: 12, color: C.negative }}>
-                ME DEBE {fmtARS(remaining)}
+                ME DEBE {fmtARS(s.abs)}
               </span>
             ) : (
               <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: 12, color: C.accent2 }}>
-                LE QUEDA A FAVOR {fmtARS(-remaining)}
+                A FAVOR {op.client} {fmtARS(s.abs)}
               </span>
             )}
             {!done && (
@@ -1381,7 +1495,7 @@ function OpCard({ op, onClick, onQuickAddTT, onPresent, onDelete }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  SCREEN · GANANCIAS
+//  SCREEN · GANANCIAS (neta $ + USDT, spread % positivo)
 // ═══════════════════════════════════════════════════════════════════
 function GananciasScreen({ ops, months, currentMonth, onUpdateOp, onDetail, notify }) {
   const [selMonth, setSelMonth] = useState(currentMonth);
@@ -1390,15 +1504,15 @@ function GananciasScreen({ ops, months, currentMonth, onUpdateOp, onDetail, noti
 
   const monthOps = useMemo(() => ops.filter(o => dateMonthKey(o.date) === selMonth), [ops, selMonth]);
 
-  const enriched = monthOps.map(op => ({
-    ...op,
-    profit: op.tcOtc ? (op.type === "compra" ? op.tcOtc - op.tcClient : op.tcClient - op.tcOtc) * op.usdtAmount : null,
-  }));
+  const enriched = monthOps.map(op => {
+    const p = opProfit(op);
+    return { ...op, _p: p, profit: p ? p.net : null, profitUsdt: p ? p.netUsdt : null, spread: p ? p.spread : null };
+  });
   const totalProfit = enriched.filter(o => o.profit !== null).reduce((s, o) => s + o.profit, 0);
+  const totalProfitUsdt = enriched.filter(o => o.profitUsdt !== null).reduce((s, o) => s + o.profitUsdt, 0);
   const totalUSDT = monthOps.reduce((s, o) => s + o.usdtAmount, 0);
   const missing = monthOps.filter(o => !o.tcOtc).length;
 
-  // Stats
   const daysOperated = new Set(monthOps.map(o => o.date)).size;
   const topClient = useMemo(() => {
     const map = {};
@@ -1415,16 +1529,16 @@ function GananciasScreen({ ops, months, currentMonth, onUpdateOp, onDetail, noti
   const byClient = useMemo(() => {
     const map = {};
     enriched.forEach(o => {
-      map[o.client] = map[o.client] || { count: 0, usdt: 0, profit: 0, ars: 0 };
+      map[o.client] = map[o.client] || { count: 0, usdt: 0, profit: 0, profitUsdt: 0, ars: 0 };
       map[o.client].count++;
       map[o.client].usdt += o.usdtAmount;
       map[o.client].ars += o.usdtAmount * o.tcClient;
       if (o.profit !== null) map[o.client].profit += o.profit;
+      if (o.profitUsdt !== null) map[o.client].profitUsdt += o.profitUsdt;
     });
     return Object.entries(map).sort((a, b) => b[1].profit - a[1].profit);
   }, [enriched]);
 
-  // Saldos acumulados (sobre TODAS las ops del usuario, no solo el mes)
   return (
     <div>
       <header style={{ padding: "48px 18px 16px" }}>
@@ -1436,7 +1550,6 @@ function GananciasScreen({ ops, months, currentMonth, onUpdateOp, onDetail, noti
       </header>
 
       <div style={{ padding: "0 16px" }}>
-        {/* Month selector */}
         {months.length > 1 && (
           <div style={{ display: "flex", gap: 6, overflowX: "auto", marginBottom: 14, paddingBottom: 2 }}>
             {months.map(m => (
@@ -1454,7 +1567,6 @@ function GananciasScreen({ ops, months, currentMonth, onUpdateOp, onDetail, noti
           </div>
         )}
 
-        {/* Profit hero */}
         <div style={{
           background: C.positiveDim, border: `1px solid ${C.positiveBorder}`,
           borderRadius: 18, padding: 22, marginBottom: 14,
@@ -1469,6 +1581,9 @@ function GananciasScreen({ ops, months, currentMonth, onUpdateOp, onDetail, noti
             </div>
             <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 30, fontWeight: 700, color: C.positive, lineHeight: 1, letterSpacing: "-0.02em" }}>
               {fmtARS(totalProfit)}
+            </div>
+            <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 14, fontWeight: 600, color: C.positive, marginTop: 6, opacity: 0.85 }}>
+              {fmtUSDT(totalProfitUsdt)}
             </div>
             <div style={{ display: "flex", gap: 18, marginTop: 12, fontSize: 11 }}>
               <div>
@@ -1489,7 +1604,6 @@ function GananciasScreen({ ops, months, currentMonth, onUpdateOp, onDetail, noti
           </div>
         </div>
 
-        {/* Stats expandible */}
         <button onClick={() => setShowStats(s => !s)} style={{
           width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between",
           padding: "12px 14px", marginBottom: 10, borderRadius: 12,
@@ -1510,7 +1624,6 @@ function GananciasScreen({ ops, months, currentMonth, onUpdateOp, onDetail, noti
           </div>
         )}
 
-        {/* By client expandible */}
         <button onClick={() => setShowByClient(s => !s)} style={{
           width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between",
           padding: "12px 14px", marginBottom: 10, borderRadius: 12,
@@ -1534,19 +1647,17 @@ function GananciasScreen({ ops, months, currentMonth, onUpdateOp, onDetail, noti
                   <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13, fontWeight: 700, color: info.profit >= 0 ? C.positive : C.negative }}>
                     {fmtARS(info.profit)}
                   </div>
+                  <div style={{ fontSize: 10, color: C.soft, marginTop: 2, fontFamily: "'JetBrains Mono', monospace" }}>{fmtUSDT(info.profitUsdt)}</div>
                 </div>
               </div>
             ))}
           </div>
         )}
 
-
-        {/* Ops list with profit */}
         {monthOps.length === 0 ? <Empty label="Sin operaciones este mes" /> : (
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {[...enriched].sort((a, b) => dateToTime(b.date) - dateToTime(a.date)).map(op => {
               const tc = T[op.type];
-              const spread = op.tcOtc ? ((op.type === "compra" ? op.tcClient - op.tcOtc : op.tcOtc - op.tcClient) / op.tcOtc) * 100 : null;
               return (
                 <div key={op.id} onClick={() => onDetail(op.id)} style={{
                   background: C.card, border: `1px solid ${C.border}`, borderRadius: 12,
@@ -1571,7 +1682,7 @@ function GananciasScreen({ ops, months, currentMonth, onUpdateOp, onDetail, noti
                             <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 14, fontWeight: 700, color: op.profit >= 0 ? C.positive : C.negative }}>
                               {fmtARS(op.profit)}
                             </div>
-                            <div style={{ fontSize: 10, color: C.soft, marginTop: 2 }}>{fmtPct(spread)} · {fmtUSDT(op.usdtAmount)}</div>
+                            <div style={{ fontSize: 10, color: C.soft, marginTop: 2 }}>{fmtPct(op.spread)} · {fmtUSDT(op.profitUsdt)}</div>
                           </>
                         : <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: C.muted }}>—</div>}
                     </div>
@@ -1599,7 +1710,7 @@ function Stat({ label, value, last }) {
 // ═══════════════════════════════════════════════════════════════════
 function BuscarScreen({ ops, onDetail }) {
   const [query, setQuery] = useState("");
-  const [filterType, setFilterType] = useState("all"); // all|compra|venta
+  const [filterType, setFilterType] = useState("all");
   const [filterClient, setFilterClient] = useState("all");
   const [filterBank, setFilterBank] = useState("all");
 
@@ -1616,12 +1727,8 @@ function BuscarScreen({ ops, onDetail }) {
       if (filterType !== "all" && op.type !== filterType) continue;
       if (filterClient !== "all" && op.client !== filterClient) continue;
       if (filterBank !== "all" && op.bank !== filterBank) continue;
-
       if (!q) { out.push({ kind: "op", op }); continue; }
-
       let matched = false;
-
-      // Match por texto: cliente, banco, exchange, nota
       if (op.client.toLowerCase().includes(q) ||
           (op.bank || "").toLowerCase().includes(q) ||
           (op.exchange || "").toLowerCase().includes(q) ||
@@ -1629,8 +1736,6 @@ function BuscarScreen({ ops, onDetail }) {
         out.push({ kind: "op", op });
         matched = true;
       }
-
-      // Match parcial por dígitos (ignora puntos/comas): total, usdt, tc, fecha, TTs
       if (!hasText && qDigits) {
         const total = String(Math.round(op.usdtAmount * op.tcClient));
         const usdt = String(Math.round(op.usdtAmount));
@@ -1640,7 +1745,6 @@ function BuscarScreen({ ops, onDetail }) {
           out.push({ kind: "op", op });
           matched = true;
         }
-        // TTs que contengan los dígitos
         op.tts.forEach((tt, idx) => {
           if (String(Math.round(tt.amount)).includes(qDigits)) {
             out.push({ kind: "tt", op, tt, idx });
@@ -1669,8 +1773,7 @@ function BuscarScreen({ ops, onDetail }) {
             style={{
               width: "100%", padding: "13px 14px 13px 38px", borderRadius: 13,
               background: "rgba(255,255,255,0.03)", border: `1px solid ${C.border}`,
-              color: C.text, fontSize: 14,
-              fontFamily: "inherit",
+              color: C.text, fontSize: 14, fontFamily: "inherit",
             }}
           />
           {query && (
@@ -1680,14 +1783,12 @@ function BuscarScreen({ ops, onDetail }) {
           )}
         </div>
 
-        {/* Search hint */}
         {query.trim() && (
           <div style={{ fontSize: 11, color: C.muted, marginBottom: 12, display: "flex", alignItems: "center", gap: 6 }}>
             <Search size={11} /> {results.length} coincidencia{results.length !== 1 ? "s" : ""}
           </div>
         )}
 
-        {/* Filters */}
         <div style={{ display: "flex", gap: 6, marginBottom: 14, overflowX: "auto" }}>
           <FilterChip label="Todas" active={filterType === "all"} onClick={() => setFilterType("all")} />
           <FilterChip label="Compras" active={filterType === "compra"} onClick={() => setFilterType("compra")} color={T.compra.primary} />
@@ -1707,7 +1808,6 @@ function BuscarScreen({ ops, onDetail }) {
           </select>
         </div>
 
-        {/* Results */}
         <div style={{ fontSize: 10, color: C.muted, textTransform: "uppercase", letterSpacing: "0.16em", marginBottom: 10, fontWeight: 700 }}>
           {results.length} resultado{results.length !== 1 ? "s" : ""}
         </div>
@@ -1766,10 +1866,7 @@ function FilterChip({ label, active, onClick, color }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  BOTTOM NAV
-// ═══════════════════════════════════════════════════════════════════
-// ═══════════════════════════════════════════════════════════════════
-//  SCREEN · SALDOS
+//  SCREEN · SALDOS (balance por favor: ME DEBE rojo / A FAVOR cian)
 // ═══════════════════════════════════════════════════════════════════
 function SaldosScreen({ ops, onClient, onMarkClient }) {
   const balances = useMemo(() => calcClientBalances(ops), [ops]);
@@ -1820,6 +1917,7 @@ function SaldosScreen({ ops, onClient, onMarkClient }) {
         {filtered.length > 0 && (
           <div style={{ marginTop: 11, fontSize: 11, color: C.muted, fontFamily: "'JetBrains Mono', monospace" }}>
             Balance neto · <span style={{ color: totalNeto >= 0 ? C.negative : C.accent2, fontWeight: 700 }}>{fmtARS(Math.abs(totalNeto))}</span>
+            <span style={{ color: C.muted, marginLeft: 6 }}>{totalNeto >= 0 ? "(me deben)" : "(a favor clientes)"}</span>
           </div>
         )}
       </header>
@@ -1841,7 +1939,7 @@ function SaldosScreen({ ops, onClient, onMarkClient }) {
           {filtered.map((cb, i) => {
             const meDebe = cb.balance > 0;
             const color = meDebe ? C.negative : C.accent2;
-            const label = meDebe ? "ME DEBE" : "LE QUEDA A FAVOR";
+            const label = meDebe ? "ME DEBE" : "A FAVOR";
             return (
               <button key={cb.client}
                 onClick={() => onClient(cb.client)}
@@ -1871,7 +1969,6 @@ function SaldosScreen({ ops, onClient, onMarkClient }) {
         </div>
       )}
 
-      {/* Confirmación marcar saldado (cliente completo) */}
       {confirmClient && (
         <>
           <div onClick={() => setConfirmClient(null)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.8)", zIndex: 200, backdropFilter: "blur(6px)", animation: "fadeIn 0.2s ease" }} />
@@ -1923,7 +2020,7 @@ function SaldoClienteSheet({ clientName, ops, onClose, onDetail, onMarkClient, o
   const color = meDebe ? C.negative : C.accent2;
   const colorDim = meDebe ? C.negativeDim : C.accent2Dim;
   const colorBorder = meDebe ? C.negativeBorder : "rgba(34,211,238,0.35)";
-  const label = meDebe ? "ME DEBE" : "LE QUEDA A FAVOR";
+  const label = meDebe ? "ME DEBE" : "A FAVOR";
 
   const totalUsdt = cb.ops.reduce((s, o) => s + o.usdt, 0);
   const totalVol = cb.ops.reduce((s, o) => s + o.total, 0);
@@ -1941,7 +2038,6 @@ function SaldoClienteSheet({ clientName, ops, onClose, onDetail, onMarkClient, o
 
   return (
     <Sheet title={clientName} onClose={onClose} subtitle={`${cb.ops.length} operación${cb.ops.length !== 1 ? "es" : ""} · vol ${fmtARS(totalVol)}`}>
-      {/* Hero balance */}
       <div style={{
         background: colorDim, border: `1px solid ${colorBorder}`,
         borderRadius: 18, padding: "18px 20px", marginBottom: 12,
@@ -1962,7 +2058,6 @@ function SaldoClienteSheet({ clientName, ops, onClose, onDetail, onMarkClient, o
         </div>
       </div>
 
-      {/* Nota del cliente */}
       <div style={{
         background: C.accentDim, border: `1px solid ${C.border}`,
         borderRadius: 14, padding: "13px 16px", marginBottom: 18,
@@ -1993,13 +2088,11 @@ function SaldoClienteSheet({ clientName, ops, onClose, onDetail, onMarkClient, o
         )}
       </div>
 
-      {/* Desglose ops */}
       <div style={{ fontSize: 10, color: C.muted, textTransform: "uppercase", letterSpacing: "0.18em", fontWeight: 700, marginBottom: 10, display: "flex", justifyContent: "space-between" }}>
         <span>Desglose</span>
         <span>{cb.ops.length} ops</span>
       </div>
 
-      {/* Tabla header */}
       <div style={{
         display: "grid", gridTemplateColumns: "52px 1fr 70px 1fr",
         padding: "0 10px 8px", borderBottom: `1px solid ${C.border}`,
@@ -2018,6 +2111,7 @@ function SaldoClienteSheet({ clientName, ops, onClose, onDetail, onMarkClient, o
       <div style={{ marginBottom: 8 }}>
         {cb.ops.map((op, i) => {
           const t = T[op.type] || T.venta;
+          const opColor = op.favor === "me" ? C.negative : C.accent2;
           return (
             <button key={op.id}
               onClick={() => onDetail(op.id)}
@@ -2037,15 +2131,19 @@ function SaldoClienteSheet({ clientName, ops, onClose, onDetail, onMarkClient, o
               </div>
               <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: C.soft }}>{op.usdt.toLocaleString("es-AR")}</div>
               <div style={{ textAlign: "center", fontFamily: "'JetBrains Mono', monospace", fontSize: 13, fontWeight: 700, color: C.accent }}>{op.tc}</div>
-              <div style={{ textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 14, fontWeight: 700, color }}>
-                {fmtARS(Math.abs(op.pending))}
+              <div style={{ textAlign: "right" }}>
+                <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 14, fontWeight: 700, color: opColor }}>
+                  {fmtARS(Math.abs(op.pending))}
+                </div>
+                <div style={{ fontSize: 7, color: opColor, letterSpacing: "0.12em", textTransform: "uppercase", fontWeight: 800, marginTop: 2, opacity: 0.8 }}>
+                  {op.favor === "me" ? "ME DEBE" : "A FAVOR"}
+                </div>
               </div>
             </button>
           );
         })}
       </div>
 
-      {/* Confirmación marcar op individual saldada */}
       {confirmOp && (() => {
         const op = cb.ops.find(o => o.id === confirmOp);
         return (
@@ -2113,6 +2211,7 @@ function BottomNav({ tab, onChange, onSettings }) {
   );
 }
 
+// Botones deshacer/rehacer ARRIBA A LA DERECHA, fila horizontal, todas las pantallas
 function UndoFab({ canUndo, canRedo, onUndo, onRedo }) {
   const btn = (enabled, onClick, Icon) => (
     <button onClick={enabled ? onClick : undefined} disabled={!enabled} style={{
@@ -2127,7 +2226,7 @@ function UndoFab({ canUndo, canRedo, onUndo, onRedo }) {
     </button>
   );
   return (
-    <div style={{ position: "fixed", right: 16, top: 16, zIndex: 60, display: "flex", gap: 8 }}>
+    <div style={{ position: "fixed", right: 16, top: 16, zIndex: 60, display: "flex", flexDirection: "row", gap: 8 }}>
       {btn(canUndo, onUndo, RotateCcw)}
       {btn(canRedo, onRedo, RotateCw)}
     </div>
@@ -2212,10 +2311,10 @@ function Empty({ label, cta }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  SHEET · NEW OP
+//  SHEET · NEW OP (con campo Comisión % manual)
 // ═══════════════════════════════════════════════════════════════════
 function NewOpSheet({ onClose, onSave, clientHistory }) {
-  const [f, setF] = useState({ type: "compra", client: "", usdtAmount: "", tcClient: "", tcOtc: "", bank: "Ripio", exchange: "", notes: "" });
+  const [f, setF] = useState({ type: "compra", client: "", usdtAmount: "", tcClient: "", tcOtc: "", commPct: "", bank: "Ripio", exchange: "", notes: "" });
   const [showSuggest, setShowSuggest] = useState(false);
   const set = (k, v) => setF(p => ({ ...p, [k]: v }));
   const tc = T[f.type];
@@ -2239,10 +2338,22 @@ function NewOpSheet({ onClose, onSave, clientHistory }) {
     setShowSuggest(false);
   };
 
-  const preview = f.usdtAmount && f.tcClient ? {
-    total: parseNum(f.usdtAmount) * parseNum(f.tcClient),
-    profit: f.tcOtc ? (f.type === "compra" ? parseNum(f.tcOtc) - parseNum(f.tcClient) : parseNum(f.tcClient) - parseNum(f.tcOtc)) * parseNum(f.usdtAmount) : null,
-  } : null;
+  const preview = (() => {
+    if (!f.usdtAmount || !f.tcClient) return null;
+    const usdt = parseNum(f.usdtAmount);
+    const tcCli = parseNum(f.tcClient);
+    const total = usdt * tcCli;
+    if (!f.tcOtc) return { total, profit: null, profitUsdt: null, spread: null };
+    const tcOtc = parseNum(f.tcOtc);
+    const grossPerUnit = f.type === "compra" ? (tcOtc - tcCli) : (tcCli - tcOtc);
+    const gross = grossPerUnit * usdt;
+    const comPct = Math.max(0, Math.min(100, parseNum(f.commPct)));
+    const comAr = usdt * tcCli * comPct / 100;
+    const net = gross - comAr;
+    const netUsdt = tcOtc ? net / tcOtc : 0;
+    const spread = tcOtc ? Math.abs((tcCli - tcOtc) / tcOtc) * 100 : 0;
+    return { total, profit: net, profitUsdt: netUsdt, spread };
+  })();
 
   const submit = () => {
     if (!valid) return;
@@ -2250,13 +2361,13 @@ function NewOpSheet({ onClose, onSave, clientHistory }) {
       type: f.type, client: f.client.trim(), date: todayStr(),
       usdtAmount: parseNum(f.usdtAmount), tcClient: parseNum(f.tcClient),
       tcOtc: f.tcOtc ? parseNum(f.tcOtc) : null,
+      commPct: f.commPct ? Math.max(0, Math.min(100, parseNum(f.commPct))) : 0,
       bank: f.bank.trim(), exchange: f.exchange.trim(), notes: f.notes.trim(),
     });
   };
 
   return (
     <Sheet title="Nueva operación" onClose={onClose} accent={tc.primary}>
-      {/* Type */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 18 }}>
         {["compra", "venta"].map(type => {
           const tt = T[type]; const active = f.type === type;
@@ -2275,7 +2386,6 @@ function NewOpSheet({ onClose, onSave, clientHistory }) {
       </div>
 
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-        {/* Client with suggestions */}
         <div style={{ position: "relative" }}>
           <Field label="Cliente" value={f.client}
             onChange={v => { set("client", v); setShowSuggest(true); }}
@@ -2308,6 +2418,8 @@ function NewOpSheet({ onClose, onSave, clientHistory }) {
           <Field label="TC OTC (opcional)" value={f.tcOtc} onChange={v => set("tcOtc", v)} onFocus={() => setShowSuggest(false)} placeholder="0" mono />
         </div>
 
+        <Field label="Comisión % (0-100, manual)" value={f.commPct} onChange={v => set("commPct", v)} onFocus={() => setShowSuggest(false)} placeholder="0" mono />
+
         <div>
           <div style={{ fontSize: 10, color: C.muted, marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.14em", fontWeight: 700 }}>Banco</div>
           <select value={f.bank} onChange={e => set("bank", e.target.value)} onFocus={() => setShowSuggest(false)}
@@ -2329,7 +2441,6 @@ function NewOpSheet({ onClose, onSave, clientHistory }) {
             }} />
         </div>
 
-        {/* Preview */}
         {preview && (
           <div style={{ background: tc.dim, border: `1px solid ${tc.border}`, borderRadius: 12, padding: "12px 14px", animation: "fadeUp 0.3s ease" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
@@ -2337,10 +2448,16 @@ function NewOpSheet({ onClose, onSave, clientHistory }) {
               <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 14, fontWeight: 700, color: C.text }}>{fmtARS(preview.total)}</span>
             </div>
             {preview.profit !== null && (
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <span style={{ fontSize: 11, color: C.soft, textTransform: "uppercase", letterSpacing: "0.1em" }}>Ganancia est.</span>
-                <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 14, fontWeight: 700, color: preview.profit >= 0 ? C.positive : C.negative }}>{fmtARS(preview.profit)}</span>
-              </div>
+              <>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                  <span style={{ fontSize: 11, color: C.soft, textTransform: "uppercase", letterSpacing: "0.1em" }}>Ganancia neta</span>
+                  <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 14, fontWeight: 700, color: preview.profit >= 0 ? C.positive : C.negative }}>{fmtARS(preview.profit)}</span>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontSize: 11, color: C.soft, textTransform: "uppercase", letterSpacing: "0.1em" }}>{fmtPct(preview.spread)} spread</span>
+                  <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13, fontWeight: 600, color: preview.profit >= 0 ? C.positive : C.negative }}>{fmtUSDT(preview.profitUsdt)}</span>
+                </div>
+              </>
             )}
           </div>
         )}
@@ -2359,7 +2476,7 @@ function NewOpSheet({ onClose, onSave, clientHistory }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  SHEET · OP DETAIL (edit any field, share, present, duplicate)
+//  SHEET · OP DETAIL
 // ═══════════════════════════════════════════════════════════════════
 function OpDetailSheet({ op, onClose, onAddTTs, onDelTT, onDelOp, onUpdate, onPresent, notify }) {
   const [waMsg, setWaMsg] = useState("");
@@ -2367,24 +2484,22 @@ function OpDetailSheet({ op, onClose, onAddTTs, onDelTT, onDelOp, onUpdate, onPr
   const [parseResult, setParseResult] = useState(null);
   const [showAdd, setShowAdd] = useState(false);
   const [confirmDel, setConfirmDel] = useState(false);
-  const [editing, setEditing] = useState(null); // field name being edited
+  const [editing, setEditing] = useState(null);
   const [editValue, setEditValue] = useState("");
 
   const tc = T[op.type];
-  const total = op.usdtAmount * op.tcClient;
-  const sent = op.tts.reduce((s, t) => s + t.amount, 0);
-  const remaining = total - sent;
-  const done = op.manualClosed || Math.abs(remaining) < 1;
-  const overshoot = remaining < 0 && !done;
-  const pct = total > 0 ? Math.min(100, Math.max(0, (sent / total) * 100)) : 0;
-  const profit = op.tcOtc ? (op.type === "compra" ? op.tcOtc - op.tcClient : op.tcClient - op.tcOtc) * op.usdtAmount : null;
+  const s = opSettlement(op);
+  const total = s.total;
+  const sent = s.moved;
+  const done = s.done;
+  const pct = s.circlePct;
+  const prof = opProfit(op);
 
   const handleParse = async () => {
     if (!waMsg.trim()) return;
     setParsing(true);
     try {
       const result = await parseWhatsApp(waMsg);
-      // Check for duplicates
       const existingAmounts = new Set(op.tts.map(t => Math.round(t.amount)));
       const duplicates = result.amounts.filter(a => existingAmounts.has(Math.round(a)));
       if (duplicates.length > 0) {
@@ -2402,12 +2517,15 @@ function OpDetailSheet({ op, onClose, onAddTTs, onDelTT, onDelOp, onUpdate, onPr
   };
 
   const startEdit = (field, value) => { setEditing(field); setEditValue(String(value ?? "")); };
-  const fieldLabels = { usdtAmount: "USDT", tcClient: "TC cliente", tcOtc: "TC OTC", bank: "Banco", exchange: "Exchange", date: "Fecha", time: "Hora", client: "Cliente" };
+  const fieldLabels = { usdtAmount: "USDT", tcClient: "TC cliente", tcOtc: "TC OTC", commPct: "Comisión %", bank: "Banco", exchange: "Exchange", date: "Fecha", time: "Hora", client: "Cliente" };
   const saveEdit = () => {
     if (!editing) return;
     let v = editValue;
-    if (["usdtAmount", "tcClient", "tcOtc"].includes(editing)) v = editing === "tcOtc" && !editValue ? null : parseNum(editValue);
-    // Validar fecha DD/MM/YYYY
+    if (["usdtAmount", "tcClient", "tcOtc", "commPct"].includes(editing)) {
+      if (editing === "tcOtc" && !editValue) v = null;
+      else if (editing === "commPct") v = Math.max(0, Math.min(100, parseNum(editValue)));
+      else v = parseNum(editValue);
+    }
     if (editing === "date") {
       const m = String(v).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
       if (!m) { notify("Formato fecha: DD/MM/YYYY", { kind: "error" }); return; }
@@ -2433,15 +2551,9 @@ function OpDetailSheet({ op, onClose, onAddTTs, onDelTT, onDelOp, onUpdate, onPr
     lines.push(`TC: ${op.tcClient.toLocaleString("es-AR")}`);
     lines.push(`Total: ${fmtARS(total)}`);
     lines.push(``);
-    lines.push(`Enviado: ${fmtARS(sent)} en ${op.tts.length} TT${op.tts.length !== 1 ? "s" : ""}`);
+    lines.push(`Movido: ${fmtARS(sent)} en ${op.tts.length} TT${op.tts.length !== 1 ? "s" : ""}`);
     lines.push(``);
-    if (done) {
-      lines.push(`✓ Operación saldada`);
-    } else if (overshoot) {
-      lines.push(`ARS a favor Gonza: ${op.client} debe ${fmtARS(-remaining)}`);
-    } else {
-      lines.push(`ARS a favor ${op.client}: ${fmtARS(remaining)}`);
-    }
+    lines.push(settlementLine(op));
     const text = lines.join("\n");
     navigator.clipboard.writeText(text).then(() => notify("✓ Copiado al portapapeles")).catch(() => notify("Error al copiar", { kind: "error" }));
   };
@@ -2453,13 +2565,11 @@ function OpDetailSheet({ op, onClose, onAddTTs, onDelTT, onDelOp, onUpdate, onPr
 
   return (
     <Sheet title={op.client} onClose={onClose} accent={tc.primary}>
-      {/* Meta */}
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
         <span style={{ fontSize: 10, fontWeight: 800, padding: "3px 9px", borderRadius: 5, background: tc.bg, color: tc.primary, letterSpacing: "0.14em" }}>{tc.label}</span>
         <span style={{ fontSize: 11, color: C.muted }}>{op.date} · {op.exchange || "—"} · {op.bank}</span>
       </div>
 
-      {/* Info grid editable */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, background: "rgba(255,255,255,0.02)", border: `1px solid ${C.border}`, borderRadius: 13, padding: "13px 14px", marginBottom: 12 }}>
         <EditableField label="USDT" field="usdtAmount" value={fmtUSDT(op.usdtAmount)} mono color={tc.primary}
           editing={editing} editValue={editValue} setEditValue={setEditValue} onStart={() => startEdit("usdtAmount", op.usdtAmount)} onSave={saveEdit} onCancel={() => setEditing(null)} />
@@ -2468,6 +2578,8 @@ function OpDetailSheet({ op, onClose, onAddTTs, onDelTT, onDelOp, onUpdate, onPr
           editing={editing} editValue={editValue} setEditValue={setEditValue} onStart={() => startEdit("tcClient", op.tcClient)} onSave={saveEdit} onCancel={() => setEditing(null)} />
         <EditableField label="TC OTC" field="tcOtc" value={op.tcOtc ? op.tcOtc.toLocaleString("es-AR") : "—"} mono color={op.tcOtc ? C.text : C.warn}
           editing={editing} editValue={editValue} setEditValue={setEditValue} onStart={() => startEdit("tcOtc", op.tcOtc)} onSave={saveEdit} onCancel={() => setEditing(null)} />
+        <EditableField label="Comisión %" field="commPct" value={(op.commPct ?? 0).toString().replace(".", ",") + "%"} mono color={C.accent2}
+          editing={editing} editValue={editValue} setEditValue={setEditValue} onStart={() => startEdit("commPct", op.commPct ?? 0)} onSave={saveEdit} onCancel={() => setEditing(null)} />
         <EditableField label="Banco" field="bank" value={op.bank}
           editing={editing} editValue={editValue} setEditValue={setEditValue} onStart={() => startEdit("bank", op.bank)} onSave={saveEdit} onCancel={() => setEditing(null)}
           options={BANKS.map(b => b.id)} />
@@ -2481,41 +2593,51 @@ function OpDetailSheet({ op, onClose, onAddTTs, onDelTT, onDelOp, onUpdate, onPr
           editing={editing} editValue={editValue} setEditValue={setEditValue} onStart={() => startEdit("client", op.client)} onSave={saveEdit} onCancel={() => setEditing(null)} />
       </div>
 
-      {/* Profit + Socios */}
-      {profit !== null && (
+      {prof && (
         <>
-          <div style={{ background: profit >= 0 ? C.positiveDim : C.negativeDim, border: `1px solid ${profit >= 0 ? C.positiveBorder : C.negativeBorder}`, borderRadius: 12, padding: "11px 14px", marginBottom: 8, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <span style={{ fontSize: 11, color: C.soft, textTransform: "uppercase", letterSpacing: "0.1em" }}>Ganancia total</span>
-            <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 16, fontWeight: 700, color: profit >= 0 ? C.positive : C.negative }}>{fmtARS(profit)}</span>
+          <div style={{ background: prof.net >= 0 ? C.positiveDim : C.negativeDim, border: `1px solid ${prof.net >= 0 ? C.positiveBorder : C.negativeBorder}`, borderRadius: 12, padding: "12px 14px", marginBottom: 8 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+              <span style={{ fontSize: 11, color: C.soft, textTransform: "uppercase", letterSpacing: "0.1em" }}>Ganancia bruta</span>
+              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13, fontWeight: 600, color: C.soft }}>{fmtARS(prof.gross)} · {fmtUSDT(prof.grossUsdt)}</span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+              <span style={{ fontSize: 11, color: C.soft, textTransform: "uppercase", letterSpacing: "0.1em" }}>Comisión {fmtPct(prof.comPct)}</span>
+              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13, fontWeight: 600, color: C.negative }}>− {fmtARS(prof.comAr)}</span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", paddingTop: 8, borderTop: `1px solid ${C.border}` }}>
+              <span style={{ fontSize: 11, color: C.text, textTransform: "uppercase", letterSpacing: "0.1em", fontWeight: 700 }}>Ganancia neta</span>
+              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 16, fontWeight: 700, color: prof.net >= 0 ? C.positive : C.negative }}>{fmtARS(prof.net)}</span>
+            </div>
+            <div style={{ textAlign: "right", marginTop: 2 }}>
+              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, fontWeight: 600, color: prof.net >= 0 ? C.positive : C.negative }}>{fmtUSDT(prof.netUsdt)} · {fmtPct(prof.spread)}</span>
+            </div>
           </div>
-          <PartnersBlock op={op} profit={profit} onUpdate={onUpdate} notify={notify} />
+          <PartnersBlock op={op} profitArs={prof.net} profitUsdt={prof.netUsdt} onUpdate={onUpdate} notify={notify} />
         </>
       )}
 
-      {/* Progress */}
-      <div style={{ background: done ? tc.dim : overshoot ? C.warnDim : C.accentDim, border: `1px solid ${done ? tc.border : overshoot ? `${C.warn}44` : C.accent + "33"}`, borderRadius: 13, padding: "13px 14px", marginBottom: 12, boxShadow: done ? tc.glow : "none" }}>
+      <div style={{ background: done ? tc.dim : s.state === "excess" ? C.negativeDim : C.accentDim, border: `1px solid ${done ? tc.border : s.state === "excess" ? `${C.negative}44` : C.accent + "33"}`, borderRadius: 13, padding: "13px 14px", marginBottom: 12, boxShadow: done ? tc.glow : "none" }}>
         <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 10 }}>
           <span style={{ color: C.soft, textTransform: "uppercase", letterSpacing: "0.1em", fontSize: 10, fontWeight: 700 }}>Progreso</span>
-          <span style={{ fontFamily: "'JetBrains Mono', monospace", color: done ? tc.primary : overshoot ? C.warn : C.accent }}>
+          <span style={{ fontFamily: "'JetBrains Mono', monospace", color: done ? tc.primary : s.state === "excess" ? C.negative : C.accent }}>
             {fmtARS(sent)} / {fmtARS(total)}
           </span>
         </div>
         <div style={{ height: 6, background: "rgba(255,255,255,0.05)", borderRadius: 3, overflow: "hidden" }}>
-          <div style={{ height: "100%", width: `${pct}%`, background: `linear-gradient(90deg, ${done ? tc.primary : C.accent}88, ${done ? tc.primary : C.accent})`, borderRadius: 3, transition: `width 0.5s ${EASE}` }} />
+          <div style={{ height: "100%", width: `${pct}%`, background: `linear-gradient(90deg, ${s.circleColor}88, ${s.circleColor})`, borderRadius: 3, transition: `width 0.5s ${EASE}` }} />
         </div>
-        <div style={{ marginTop: 9, textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: done ? tc.primary : overshoot ? C.warn : C.accent2, fontWeight: 700 }}>
-          {done ? "✓ Saldado" : overshoot ? `${op.client} debe ${fmtARS(-remaining)}` : `A favor ${op.client}: ${fmtARS(remaining)}`}
+        <div style={{ marginTop: 9, textAlign: "right", fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: done ? tc.primary : s.favor === "me" ? C.negative : C.accent2, fontWeight: 700 }}>
+          {settlementLine(op)}
         </div>
       </div>
 
-      {/* Actions row */}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 6, marginBottom: 14 }}>
+      {/* Acciones — 3 columnas iguales, ancho completo */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8, marginBottom: 14 }}>
         <ActionBtn icon={Copy} label="Copiar" onClick={copyProgress} />
         <ActionBtn icon={Eye} label="Mostrar" onClick={onPresent} />
         <ActionBtn icon={FileText} label="Excel" onClick={exportClient} />
       </div>
 
-      {/* Notes */}
       {op.notes && (
         <div style={{ background: "rgba(255,255,255,0.02)", border: `1px solid ${C.border}`, borderRadius: 11, padding: "10px 13px", marginBottom: 12 }}>
           <div style={{ fontSize: 9, color: C.muted, textTransform: "uppercase", letterSpacing: "0.14em", marginBottom: 4, fontWeight: 700, display: "flex", alignItems: "center", gap: 6 }}>
@@ -2529,12 +2651,10 @@ function OpDetailSheet({ op, onClose, onAddTTs, onDelTT, onDelOp, onUpdate, onPr
         {op.notes ? "Editar nota" : "Agregar nota"}
       </button>
 
-      {/* TTs con edición */}
       {op.tts.length > 0 && (
         <TTsList op={op} sent={sent} onDelTT={onDelTT} onUpdate={onUpdate} notify={notify} />
       )}
 
-      {/* Add TT */}
       {!showAdd
         ? <button onClick={() => setShowAdd(true)} style={{ width: "100%", padding: 12, borderRadius: 12, border: `1px dashed ${C.accent}66`, color: C.accent, fontSize: 11, fontWeight: 700, letterSpacing: "0.14em", textTransform: "uppercase", marginBottom: 14, fontFamily: "inherit", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
             <Plus size={14} /> Agregar TT desde WhatsApp
@@ -2542,7 +2662,6 @@ function OpDetailSheet({ op, onClose, onAddTTs, onDelTT, onDelOp, onUpdate, onPr
         : <AddTTBox waMsg={waMsg} setWaMsg={setWaMsg} parsing={parsing} parseResult={parseResult} handleParse={handleParse} confirmAdd={confirmAdd} onCancel={() => { setShowAdd(false); setWaMsg(""); setParseResult(null); }} />
       }
 
-      {/* Toggles */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 10 }}>
         <button onClick={() => { onUpdate(op.id, { manualClosed: !op.manualClosed }); notify(op.manualClosed ? "Operación reabierta" : "✓ Marcada como completa"); }} style={{
           padding: "12px 10px", borderRadius: 11,
@@ -2564,7 +2683,6 @@ function OpDetailSheet({ op, onClose, onAddTTs, onDelTT, onDelOp, onUpdate, onPr
         </button>
       </div>
 
-      {/* Delete */}
       {!confirmDel
         ? <button onClick={() => setConfirmDel(true)} style={{ width: "100%", padding: 12, borderRadius: 12, border: `1px solid ${C.negative}33`, color: C.negative + "aa", fontSize: 11, fontWeight: 700, letterSpacing: "0.14em", textTransform: "uppercase", fontFamily: "inherit" }}>
             Eliminar operación
@@ -2578,7 +2696,7 @@ function OpDetailSheet({ op, onClose, onAddTTs, onDelTT, onDelOp, onUpdate, onPr
   );
 }
 
-function PartnersBlock({ op, profit, onUpdate, notify }) {
+function PartnersBlock({ op, profitArs, profitUsdt, onUpdate, notify }) {
   const [expanded, setExpanded] = useState(false);
   const [adding, setAdding] = useState(false);
   const [newName, setNewName] = useState("");
@@ -2587,10 +2705,11 @@ function PartnersBlock({ op, profit, onUpdate, notify }) {
   const partners = op.partners || [];
   const totalPartnerPct = partners.reduce((s, p) => s + (p.pct || 0), 0);
   const myPct = Math.max(0, 100 - totalPartnerPct);
-  const myShare = profit * (myPct / 100);
+  const myShare = profitArs * (myPct / 100);
+  const myShareUsdt = profitUsdt * (myPct / 100);
 
   const addPartner = () => {
-    const pct = parseFloat(newPct);
+    const pct = parseFloat(String(newPct).replace(",", "."));
     if (!newName.trim() || isNaN(pct) || pct <= 0 || pct > 100) {
       notify("Nombre y % válido (1-100)", { kind: "error" });
       return;
@@ -2628,28 +2747,37 @@ function PartnersBlock({ op, profit, onUpdate, notify }) {
 
       {expanded && (
         <div style={{ background: C.card, border: `1px solid ${C.border}`, borderTop: "none", borderRadius: "0 0 11px 11px", padding: "12px 14px", marginTop: -1 }}>
-          {/* Mi parte */}
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: `1px solid ${C.border}` }}>
             <div>
               <div style={{ fontSize: 12, color: C.text, fontWeight: 700 }}>Yo (Gonza)</div>
               <div style={{ fontSize: 10, color: C.muted, marginTop: 2 }}>{myPct.toFixed(1).replace(".",",")}%</div>
             </div>
-            <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 14, fontWeight: 700, color: myShare >= 0 ? C.positive : C.negative }}>
-              {fmtARS(myShare)}
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 14, fontWeight: 700, color: myShare >= 0 ? C.positive : C.negative }}>
+                {fmtARS(myShare)}
+              </div>
+              <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, fontWeight: 600, color: myShare >= 0 ? C.positive : C.negative, opacity: 0.85 }}>
+                {fmtUSDT(myShareUsdt)}
+              </div>
             </div>
           </div>
 
-          {/* Socios */}
           {partners.map(p => {
-            const share = profit * (p.pct / 100);
+            const shareArs = profitArs * (p.pct / 100);
+            const shareUsdt = profitUsdt * (p.pct / 100);
             return (
               <div key={p.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: `1px solid ${C.border}` }}>
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: 12, color: C.text, fontWeight: 700 }}>{p.name}</div>
                   <div style={{ fontSize: 10, color: C.muted, marginTop: 2 }}>{p.pct.toFixed(1).replace(".",",")}%</div>
                 </div>
-                <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 14, fontWeight: 700, color: share >= 0 ? C.positive : C.negative, marginRight: 10 }}>
-                  {fmtARS(share)}
+                <div style={{ textAlign: "right", marginRight: 10 }}>
+                  <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 14, fontWeight: 700, color: shareArs >= 0 ? C.positive : C.negative }}>
+                    {fmtARS(shareArs)}
+                  </div>
+                  <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, fontWeight: 600, color: shareArs >= 0 ? C.positive : C.negative, opacity: 0.85 }}>
+                    {fmtUSDT(shareUsdt)}
+                  </div>
                 </div>
                 <button onClick={() => removePartner(p.id)} style={{ color: "rgba(251,113,133,0.55)" }}>
                   <X size={15} />
@@ -2658,7 +2786,6 @@ function PartnersBlock({ op, profit, onUpdate, notify }) {
             );
           })}
 
-          {/* Agregar */}
           {!adding ? (
             <button onClick={() => setAdding(true)} style={{
               width: "100%", marginTop: 8, padding: "9px", borderRadius: 9,
@@ -2695,7 +2822,6 @@ function TTsList({ op, sent, onDelTT, onUpdate, notify }) {
   const [ttSearch, setTtSearch] = useState("");
   const [showSearch, setShowSearch] = useState(false);
 
-  // Filtrar TTs por búsqueda (match parcial de dígitos)
   const searchDigits = ttSearch.replace(/\D/g, "");
   const visibleTTs = searchDigits
     ? op.tts.filter(tt => String(Math.round(tt.amount)).includes(searchDigits))
@@ -2837,7 +2963,7 @@ function TTsList({ op, sent, onDelTT, onUpdate, notify }) {
 function ActionBtn({ icon: Icon, label, onClick }) {
   return (
     <button onClick={onClick} style={{
-      padding: "10px 6px", borderRadius: 11,
+      width: "100%", padding: "10px 6px", borderRadius: 11,
       background: "rgba(255,255,255,0.03)", border: `1px solid ${C.border}`,
       color: C.text, fontSize: 9, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase",
       fontFamily: "inherit", display: "flex", flexDirection: "column", alignItems: "center", gap: 4,
@@ -2889,7 +3015,6 @@ function EditableField({ label, field, value, mono, color, editing, editValue, s
 
 function AddTTBox({ waMsg, setWaMsg, parsing, parseResult, handleParse, confirmAdd, onCancel }) {
   const [kept, setKept] = useState(null);
-  // Resetear lista editable cuando llega un nuevo parseResult
   useEffect(() => {
     if (parseResult?.amounts) setKept(parseResult.amounts.map((a, i) => ({ id: i + "-" + a, value: a })));
     else setKept(null);
@@ -2962,9 +3087,6 @@ function AddTTBox({ waMsg, setWaMsg, parsing, parseResult, handleParse, confirmA
   );
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  SHEET · QUICK ADD TT (desde home)
-// ═══════════════════════════════════════════════════════════════════
 function QuickTTSheet({ op, onClose, onAddTTs, notify }) {
   const [waMsg, setWaMsg] = useState("");
   const [parsing, setParsing] = useState(false);
@@ -3005,14 +3127,13 @@ function QuickTTSheet({ op, onClose, onAddTTs, notify }) {
 // ═══════════════════════════════════════════════════════════════════
 function PresentSheet({ op, onClose, notify }) {
   const tc = T[op.type];
-  const total = op.usdtAmount * op.tcClient;
-  const sent = op.tts.reduce((s, t) => s + t.amount, 0);
-  const remaining = total - sent;
-  const done = op.manualClosed || Math.abs(remaining) < 1;
-  const overshoot = remaining < 0 && !done;
-  const pct = total > 0 ? Math.min(100, Math.max(0, (sent / total) * 100)) : 0;
+  const s = opSettlement(op);
+  const total = s.total;
+  const sent = s.moved;
+  const done = s.done;
+  const isExcess = s.state === "excess" && !done;
+  const pct = s.circlePct;
 
-  // ── Compartir como TEXTO simple (WhatsApp) ──
   const buildText = () => {
     const L = [];
     L.push(`${op.usdtAmount.toLocaleString("es-AR")} usdt x ${op.tcClient.toLocaleString("es-AR")}`);
@@ -3021,8 +3142,8 @@ function PresentSheet({ op, onClose, notify }) {
     op.tts.forEach(tt => L.push(`- ${fmtARS(tt.amount)}`));
     L.push("=");
     if (done) L.push("Saldado ✓");
-    else if (overshoot) L.push(`${fmtARS(Math.abs(remaining))} a favor`);
-    else L.push(`${fmtARS(remaining)} pendiente`);
+    else if (s.favor === "client") L.push(`${fmtARS(s.abs)} a favor`);
+    else L.push(`${fmtARS(s.abs)} pendiente`);
     return L.join("\n");
   };
   const shareText = async () => {
@@ -3034,7 +3155,6 @@ function PresentSheet({ op, onClose, notify }) {
     catch { notify("Error al copiar", { kind: "error" }); }
   };
 
-  // ── Compartir como IMAGEN (canvas, sin info privada) ──
   const buildImage = () => {
     const scale = 2;
     const W = 540, pad = 36;
@@ -3046,28 +3166,20 @@ function PresentSheet({ op, onClose, notify }) {
     cv.width = W * scale; cv.height = H * scale;
     const x = cv.getContext("2d");
     x.scale(scale, scale);
-    // Fondo
     x.fillStyle = "#0a0612"; x.fillRect(0, 0, W, H);
-    // Borde sutil
     x.strokeStyle = "rgba(180,100,220,0.3)"; x.lineWidth = 2;
     x.strokeRect(8, 8, W - 16, H - 16);
-    // Marca
     x.fillStyle = "#a595bb"; x.font = "700 13px sans-serif";
     x.fillText("P L E X O", pad, 44);
-    // Tipo badge
     const tcol = op.type === "compra" ? "#5eead4" : "#fb7185";
     x.fillStyle = tcol; x.font = "800 12px sans-serif";
     x.fillText(tc.label, pad, 76);
-    // Cliente
     x.fillStyle = "#fefdff"; x.font = "800 36px sans-serif";
     x.fillText(op.client, pad, 122);
-    // Fecha
     x.fillStyle = "#a595bb"; x.font = "600 14px sans-serif";
     x.fillText(op.date, pad, 148);
-    // Divider
     x.strokeStyle = "rgba(180,100,220,0.25)"; x.lineWidth = 1;
     x.beginPath(); x.moveTo(pad, 168); x.lineTo(W - pad, 168); x.stroke();
-    // USDT x TC
     x.fillStyle = "#cebede"; x.font = "600 15px sans-serif";
     x.fillText("USDT", pad, 196);
     x.fillStyle = "#fefdff"; x.font = "700 18px monospace";
@@ -3076,15 +3188,12 @@ function PresentSheet({ op, onClose, notify }) {
     x.fillText("TIPO DE CAMBIO", W / 2, 196);
     x.fillStyle = "#fefdff"; x.font = "700 18px monospace";
     x.fillText(op.tcClient.toLocaleString("es-AR"), W / 2, 220);
-    // Total
     x.fillStyle = "#cebede"; x.font = "600 14px sans-serif";
     x.fillText("TOTAL", pad, 256);
     x.fillStyle = "#fefdff"; x.font = "800 26px monospace";
     x.fillText(fmtARS(total), pad, 286);
-    // Divider
     x.strokeStyle = "rgba(180,100,220,0.25)";
     x.beginPath(); x.moveTo(pad, 304); x.lineTo(W - pad, 304); x.stroke();
-    // TTs
     let yy = 304 + 34;
     x.fillStyle = "#a595bb"; x.font = "700 12px sans-serif";
     x.fillText("TRANSFERENCIAS", pad, yy - 6);
@@ -3098,14 +3207,13 @@ function PresentSheet({ op, onClose, notify }) {
       x.textAlign = "left";
       yy += rowH;
     });
-    // Resultado
     yy += 10;
     x.strokeStyle = "rgba(180,100,220,0.25)";
     x.beginPath(); x.moveTo(pad, yy); x.lineTo(W - pad, yy); x.stroke();
     yy += 36;
-    const resCol = done ? "#5eead4" : overshoot ? "#fb7185" : "#fbbf24";
-    const resLbl = done ? "SALDADO" : overshoot ? "A FAVOR" : "PENDIENTE";
-    const resVal = done ? "✓" : fmtARS(Math.abs(remaining));
+    const resCol = done ? "#5eead4" : isExcess ? "#fb7185" : "#fbbf24";
+    const resLbl = done ? "SALDADO" : s.favor === "client" ? "A FAVOR" : "PENDIENTE";
+    const resVal = done ? "✓" : fmtARS(s.abs);
     x.fillStyle = resCol; x.font = "800 13px sans-serif";
     x.fillText(resLbl, pad, yy);
     x.fillStyle = resCol; x.font = "800 24px monospace";
@@ -3126,7 +3234,6 @@ function PresentSheet({ op, onClose, notify }) {
             return;
           }
         } catch (e) { if (e.name === "AbortError") return; }
-        // Fallback: descargar
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url; a.download = file.name;
@@ -3142,7 +3249,6 @@ function PresentSheet({ op, onClose, notify }) {
       <div style={{ position: "fixed", inset: 0, background: C.bg, zIndex: 200, animation: "fadeIn 0.3s ease", overflowY: "auto" }}>
         <BgGrid />
         <div style={{ position: "relative", zIndex: 1, padding: "20px 20px 40px", maxWidth: 480, margin: "0 auto" }}>
-          {/* Header */}
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 36 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <AtomLogo size={26} />
@@ -3153,41 +3259,38 @@ function PresentSheet({ op, onClose, notify }) {
             </button>
           </div>
 
-          {/* Client + type badge */}
           <div style={{ textAlign: "center", marginBottom: 28 }}>
             <span style={{ fontSize: 10, fontWeight: 800, padding: "4px 12px", borderRadius: 6, background: tc.bg, color: tc.primary, letterSpacing: "0.18em" }}>{tc.label}</span>
             <h1 style={{ fontSize: 36, fontWeight: 800, letterSpacing: "-0.03em", margin: "16px 0 6px", lineHeight: 1 }}>{op.client}</h1>
             <div style={{ fontSize: 11, color: C.muted, letterSpacing: "0.16em", textTransform: "uppercase", fontWeight: 600 }}>{op.date}</div>
           </div>
 
-          {/* Stats grid */}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 22 }}>
             <BigStat label="USDT" value={fmtUSDT(op.usdtAmount)} color={tc.primary} />
             <BigStat label="Tipo de cambio" value={op.tcClient.toLocaleString("es-AR")} />
             <BigStat label="Total ARS" value={fmtARS(total)} fullWidth />
           </div>
 
-          {/* Progress hero */}
           <div style={{
-            background: done ? C.positiveDim : overshoot ? C.negativeDim : C.card,
-            border: `1px solid ${done ? C.positiveBorder : overshoot ? C.negativeBorder : C.border}`,
+            background: done ? C.positiveDim : isExcess ? C.negativeDim : C.card,
+            border: `1px solid ${done ? C.positiveBorder : isExcess ? C.negativeBorder : C.border}`,
             borderRadius: 18, padding: 22, marginBottom: 22,
             backdropFilter: "blur(20px)",
-            boxShadow: done ? `0 0 40px ${C.positive}20` : overshoot ? `0 0 40px ${C.negative}20` : "none",
+            boxShadow: done ? `0 0 40px ${C.positive}20` : isExcess ? `0 0 40px ${C.negative}20` : "none",
             textAlign: "center",
           }}>
-            <div style={{ fontSize: 10, color: done ? C.positive : overshoot ? C.negative : C.muted, textTransform: "uppercase", letterSpacing: "0.22em", marginBottom: 12, fontWeight: 800 }}>
-              {done ? "✓ Saldado" : overshoot ? "Sobrante" : "Pendiente"}
+            <div style={{ fontSize: 10, color: done ? C.positive : isExcess ? C.negative : C.muted, textTransform: "uppercase", letterSpacing: "0.22em", marginBottom: 12, fontWeight: 800 }}>
+              {done ? "✓ Saldado" : s.favor === "client" ? "A favor" : "Pendiente"}
             </div>
-            <div style={{ fontSize: 34, fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, letterSpacing: "-0.02em", marginBottom: 18, color: done ? C.positive : overshoot ? C.negative : C.text, lineHeight: 1 }}>
-              {done ? fmtARS(total) : overshoot ? fmtARS(-remaining) : fmtARS(remaining)}
+            <div style={{ fontSize: 34, fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, letterSpacing: "-0.02em", marginBottom: 18, color: done ? C.positive : isExcess ? C.negative : C.text, lineHeight: 1 }}>
+              {done ? fmtARS(total) : fmtARS(s.abs)}
             </div>
             <div style={{ height: 6, background: "rgba(255,255,255,0.05)", borderRadius: 3, overflow: "hidden", marginBottom: 14 }}>
-              <div style={{ height: "100%", width: `${pct}%`, background: done ? `linear-gradient(90deg, ${C.positive}, ${C.positive})` : overshoot ? `linear-gradient(90deg, ${C.negative}, ${C.negative})` : `linear-gradient(90deg, ${C.accent}, ${C.accent2})`, borderRadius: 3, transition: `width 1s ${EASE}` }} />
+              <div style={{ height: "100%", width: `${pct}%`, background: done ? `linear-gradient(90deg, ${C.positive}, ${C.positive})` : isExcess ? `linear-gradient(90deg, ${C.negative}, ${C.negative})` : `linear-gradient(90deg, ${C.accent}, ${C.accent2})`, borderRadius: 3, transition: `width 1s ${EASE}` }} />
             </div>
             <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}>
               <div>
-                <div style={{ color: C.muted, fontSize: 9, textTransform: "uppercase", letterSpacing: "0.14em", marginBottom: 3, fontWeight: 700 }}>Enviado</div>
+                <div style={{ color: C.muted, fontSize: 9, textTransform: "uppercase", letterSpacing: "0.14em", marginBottom: 3, fontWeight: 700 }}>Movido</div>
                 <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13, fontWeight: 600 }}>{fmtARS(sent)}</div>
               </div>
               <div style={{ textAlign: "right" }}>
@@ -3197,24 +3300,22 @@ function PresentSheet({ op, onClose, notify }) {
             </div>
           </div>
 
-          {/* Status message elegant */}
           {!done && (
             <div style={{
-              background: overshoot ? C.negativeDim : C.positiveDim,
-              border: `1px solid ${overshoot ? C.negativeBorder : C.positiveBorder}`,
+              background: s.favor === "me" ? C.negativeDim : C.positiveDim,
+              border: `1px solid ${s.favor === "me" ? C.negativeBorder : C.positiveBorder}`,
               borderRadius: 13, padding: "14px 18px", marginBottom: 22,
               textAlign: "center",
             }}>
-              <div style={{ fontSize: 10, color: overshoot ? C.negative : C.positive, textTransform: "uppercase", letterSpacing: "0.18em", marginBottom: 4, fontWeight: 800 }}>
-                {overshoot ? `${op.client} debe` : `ARS a favor ${op.client}`}
+              <div style={{ fontSize: 10, color: s.favor === "me" ? C.negative : C.positive, textTransform: "uppercase", letterSpacing: "0.18em", marginBottom: 4, fontWeight: 800 }}>
+                {s.favor === "me" ? `${op.client} debe` : `A favor ${op.client}`}
               </div>
-              <div style={{ fontSize: 22, fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, color: overshoot ? C.negative : C.positive }}>
-                {fmtARS(Math.abs(remaining))}
+              <div style={{ fontSize: 22, fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, color: s.favor === "me" ? C.negative : C.positive }}>
+                {fmtARS(s.abs)}
               </div>
             </div>
           )}
 
-          {/* TTs */}
           {op.tts.length > 0 && (
             <div style={{ marginBottom: 90 }}>
               <div style={{ fontSize: 10, color: C.muted, textTransform: "uppercase", letterSpacing: "0.18em", marginBottom: 10, fontWeight: 700, display: "flex", justifyContent: "space-between" }}>
@@ -3233,7 +3334,6 @@ function PresentSheet({ op, onClose, notify }) {
           )}
         </div>
 
-        {/* Barra de compartir fija */}
         <div style={{
           position: "fixed", bottom: 0, left: "50%", transform: "translateX(-50%)",
           width: "100%", maxWidth: 480, zIndex: 2,
@@ -3355,7 +3455,6 @@ function SettingsSheet({ ops, prefs, onClose, onImport, notify }) {
   return (
     <Sheet title="Más" subtitle="Drive, backup, info" onClose={onClose}>
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-        {/* Google Drive */}
         <div style={{
           background: needsReconnect ? C.warnDim : driveStatus.connected ? C.positiveDim : C.accentDim,
           border: `1px solid ${needsReconnect ? C.warn + "66" : driveStatus.connected ? C.positiveBorder : C.accent + "44"}`,
@@ -3398,7 +3497,6 @@ function SettingsSheet({ ops, prefs, onClose, onImport, notify }) {
         <Row icon={Upload} label="Restaurar backup" desc="Cargá un JSON exportado previamente" onClick={() => fileInput.current?.click()} />
         <input ref={fileInput} type="file" accept=".json" onChange={doImport} style={{ display: "none" }} />
 
-        {/* Excel Alasia */}
         <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 14, padding: "14px 16px" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }}>
             <div style={{ width: 38, height: 38, borderRadius: 11, background: C.accentDim, display: "flex", alignItems: "center", justifyContent: "center" }}>
