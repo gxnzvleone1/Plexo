@@ -206,6 +206,9 @@ const KEY_PREFS = "plexo-prefs-v1";
 const KEY_CLIENT_NOTES = "plexo-client-notes-v1";
 const loadClientNotes = () => { try { return JSON.parse(localStorage.getItem(KEY_CLIENT_NOTES) || "{}"); } catch { return {}; } };
 const saveClientNotes = (n) => { try { localStorage.setItem(KEY_CLIENT_NOTES, JSON.stringify(n)); } catch {} };
+const KEY_NOTES = "plexo-general-notes-v1";
+const loadGeneralNotes = () => { try { return localStorage.getItem(KEY_NOTES) || ""; } catch { return ""; } };
+const saveGeneralNotes = (t) => { try { localStorage.setItem(KEY_NOTES, t); } catch {} };
 
 
 // Storage: localStorage + auto-sync Drive
@@ -1008,6 +1011,45 @@ export default function App() {
     notify(nowClosed ? "✓ Operación marcada saldada" : "Operación reabierta");
   }, [setOps, notify]);
 
+  // Fusionar 2+ ops del mismo cliente: USDT sumado, TC promedio ponderado,
+  // une todas las TTs (cada una conserva su banco). Banco/exchange: si todas
+  // coinciden los hereda; si no, usa override pasado o queda en blanco.
+  const mergeOps = useCallback((opIds, override = {}) => {
+    setOps(p => {
+      const sel = p.filter(o => opIds.includes(o.id));
+      if (sel.length < 2) return p;
+      const base = sel[0];
+      const totalUsdt = sel.reduce((s, o) => s + (o.usdtAmount || 0), 0);
+      // TC promedio ponderado por USDT
+      const wTC = totalUsdt > 0
+        ? sel.reduce((s, o) => s + (o.tcClient || 0) * (o.usdtAmount || 0), 0) / totalUsdt
+        : base.tcClient;
+      const allBank = sel.every(o => o.bank === base.bank) ? base.bank : "";
+      const allExch = sel.every(o => o.exchange === base.exchange) ? base.exchange : "";
+      // Cada TT conserva su banco; si la op tenía banco propio y la TT no, se le fija
+      const mergedTTs = sel.flatMap(o => o.tts.map(t => ({
+        ...t, bank: t.bank || (o.bank !== allBank ? o.bank : undefined),
+      })));
+      const notes = sel.map(o => o.notes).filter(Boolean).join("\n");
+      const merged = {
+        ...base,
+        id: uid(),
+        usdtAmount: +totalUsdt.toFixed(2),
+        tcClient: +wTC.toFixed(4),
+        bank: override.bank !== undefined ? override.bank : allBank,
+        exchange: override.exchange !== undefined ? override.exchange : allExch,
+        tts: mergedTTs,
+        notes,
+        tcOtc: base.tcOtc ?? null,
+        ts: Date.now(), createdAt: Date.now(),
+      };
+      const rest = p.filter(o => !opIds.includes(o.id));
+      return [...rest, merged];
+    });
+    notify(`✓ ${opIds.length} operaciones fusionadas`);
+    setSheet(null);
+  }, [setOps, notify]);
+
   // ── Memoized data ──
   const today = todayStr();
   const todayOps = useMemo(() => ops.filter(o => o.date === today), [ops, today]);
@@ -1128,6 +1170,7 @@ export default function App() {
         onDetail={id => setSheet({ kind: "detail", id })}
         onMarkClient={markClientSettled}
         onToggleOp={toggleOpSettled}
+        onMerge={mergeOps}
         notify={notify}
       />}
 
@@ -1435,9 +1478,10 @@ function OpCard({ op, onClick, onQuickAddTT, onPresent, onDelete }) {
         <div style={{ position: "absolute", top: 0, left: 0, width: 3, bottom: 0, background: `linear-gradient(180deg, ${tc.primary}, ${tc.primary}55)`, borderRadius: "3px 0 0 3px" }} />
 
         <div style={{ marginLeft: 8 }}>
+          {/* Fila superior: nombre+badge izq · TC + ⚡ der */}
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 }}>
             <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 2 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 2, flexWrap: "wrap" }}>
                 <span style={{ fontSize: 15, fontWeight: 700, color: C.text }}>{op.client}</span>
                 <span style={{ fontSize: 8, fontWeight: 800, padding: "2px 6px", borderRadius: 4, background: tc.bg, color: tc.primary, letterSpacing: "0.12em" }}>
                   {tc.label}
@@ -1449,11 +1493,20 @@ function OpCard({ op, onClick, onQuickAddTT, onPresent, onDelete }) {
                 {op.date.slice(0, 5)}
               </div>
             </div>
-            <div style={{ textAlign: "right", marginLeft: 8 }}>
-              <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, fontWeight: 700, color: tc.primary }}>
-                {fmtUSDT(op.usdtAmount)}
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: 8, flexShrink: 0 }}>
+              <div style={{ fontSize: 11, color: C.muted, fontFamily: "'JetBrains Mono', monospace", fontWeight: 600 }}>
+                TC {op.tcClient.toLocaleString("es-AR")}
               </div>
-              <div style={{ fontSize: 10, color: C.muted, marginTop: 2 }}>TC {op.tcClient.toLocaleString("es-AR")}</div>
+              {!done && (
+                <button onClick={e => { e.stopPropagation(); onQuickAddTT(); }} style={{
+                  width: 30, height: 30, borderRadius: 9,
+                  background: C.accentDim, border: `1px solid ${C.accent}44`, color: C.accent,
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  transition: `all 0.2s ${EASE}`,
+                }} title="Agregar TT rápido">
+                  <Zap size={14} strokeWidth={2.5} />
+                </button>
+              )}
             </div>
           </div>
 
@@ -1465,27 +1518,21 @@ function OpCard({ op, onClick, onQuickAddTT, onPresent, onDelete }) {
             }} />
           </div>
 
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 11 }}>
+          {/* Fila inferior: USDT total izq · estado der */}
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 11, gap: 10 }}>
+            <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13, fontWeight: 700, color: tc.primary, flexShrink: 0 }}>
+              {fmtUSDT(op.usdtAmount)}
+            </span>
             {done ? (
-              <span style={{ color: tc.primary, fontFamily: "'JetBrains Mono', monospace", fontWeight: 700 }}>✓ Completo</span>
+              <span style={{ color: tc.primary, fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, textAlign: "right" }}>✓ Completo</span>
             ) : s.favor === "me" ? (
-              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: 12, color: C.negative }}>
+              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: 12, color: C.negative, textAlign: "right" }}>
                 ME DEBE {fmtARS(s.abs)}
               </span>
             ) : (
-              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: 12, color: C.accent2 }}>
-                A FAVOR {op.client} {fmtARS(s.abs)}
+              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, fontSize: 12, color: C.accent2, textAlign: "right" }}>
+                A FAVOR {fmtARS(s.abs)}
               </span>
-            )}
-            {!done && (
-              <button onClick={e => { e.stopPropagation(); onQuickAddTT(); }} style={{
-                width: 26, height: 26, borderRadius: 8,
-                background: C.accentDim, border: `1px solid ${C.accent}44`, color: C.accent,
-                display: "flex", alignItems: "center", justifyContent: "center",
-                transition: `all 0.2s ${EASE}`,
-              }} title="Agregar TT rápido">
-                <Zap size={12} strokeWidth={2.5} />
-              </button>
             )}
           </div>
         </div>
@@ -1865,6 +1912,25 @@ function FilterChip({ label, active, onClick, color }) {
   );
 }
 
+// Donut de completitud para Saldos (% adentro)
+function SaldoDonut({ pct, color }) {
+  const p = Math.max(0, Math.min(100, pct || 0));
+  const r = 16, c = 2 * Math.PI * r;
+  const off = c * (1 - p / 100);
+  return (
+    <svg width="40" height="40" viewBox="0 0 40 40" style={{ display: "block" }}>
+      <circle cx="20" cy="20" r={r} fill="none" stroke="rgba(255,255,255,0.08)" strokeWidth="4" />
+      <circle cx="20" cy="20" r={r} fill="none" stroke={color} strokeWidth="4"
+        strokeDasharray={c} strokeDashoffset={off} strokeLinecap="round"
+        transform="rotate(-90 20 20)" style={{ transition: `stroke-dashoffset 0.6s ${EASE}` }} />
+      <text x="20" y="20" textAnchor="middle" dominantBaseline="central"
+        fill={color} fontSize="10" fontWeight="700" fontFamily="'JetBrains Mono', monospace">
+        {Math.round(p)}%
+      </text>
+    </svg>
+  );
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  SCREEN · SALDOS (balance por favor: ME DEBE rojo / A FAVOR cian)
 // ═══════════════════════════════════════════════════════════════════
@@ -1927,12 +1993,14 @@ function SaldosScreen({ ops, onClient, onMarkClient }) {
       ) : (
         <div style={{ padding: "0 18px" }}>
           <div style={{
-            display: "grid", gridTemplateColumns: "1fr 46px 1.4fr",
+            display: "grid", gridTemplateColumns: "1fr 36px 44px 1.15fr",
             padding: "9px 12px", borderBottom: `1px solid ${C.border}`,
-            fontSize: 9, color: C.muted, letterSpacing: "0.18em", textTransform: "uppercase", fontWeight: 700,
+            fontSize: 9, color: C.muted, letterSpacing: "0.16em", textTransform: "uppercase", fontWeight: 700,
+            alignItems: "center", gap: 6,
           }}>
             <span>Cliente</span>
             <span style={{ textAlign: "center" }}>Ops</span>
+            <span style={{ textAlign: "center" }}>%</span>
             <span style={{ textAlign: "right" }}>Saldo</span>
           </div>
 
@@ -1940,6 +2008,9 @@ function SaldosScreen({ ops, onClient, onMarkClient }) {
             const meDebe = cb.balance > 0;
             const color = meDebe ? C.negative : C.accent2;
             const label = meDebe ? "ME DEBE" : "A FAVOR";
+            const sumSent = cb.ops.reduce((a, o) => a + (o.sent || 0), 0);
+            const sumTotal = cb.ops.reduce((a, o) => a + (o.total || 0), 0);
+            const cliPct = sumTotal > 0 ? Math.min(100, (sumSent / sumTotal) * 100) : 0;
             return (
               <button key={cb.client}
                 onClick={() => onClient(cb.client)}
@@ -1948,13 +2019,16 @@ function SaldosScreen({ ops, onClient, onMarkClient }) {
                 onTouchMove={cancelPress}
                 onContextMenu={e => { e.preventDefault(); setConfirmClient(cb.client); }}
                 style={{
-                  display: "grid", gridTemplateColumns: "1fr 46px 1.4fr",
-                  width: "100%", padding: "15px 12px", alignItems: "center", textAlign: "left",
+                  display: "grid", gridTemplateColumns: "1fr 36px 44px 1.15fr",
+                  width: "100%", padding: "13px 12px", alignItems: "center", textAlign: "left", gap: 6,
                   borderBottom: i < filtered.length - 1 ? `1px solid ${C.border}` : "none",
                   background: "transparent", transition: `background 0.2s ${EASE}`,
                 }}>
                 <span style={{ fontSize: 15, fontWeight: 700, color: C.text }}>{cb.client}</span>
                 <span style={{ textAlign: "center", fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: C.muted }}>{cb.ops.length}</span>
+                <div style={{ display: "flex", justifyContent: "center" }}>
+                  <SaldoDonut pct={cliPct} color={color} />
+                </div>
                 <div style={{ textAlign: "right" }}>
                   <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 15, fontWeight: 700, color }}>
                     {fmtARS(Math.abs(cb.balance))}
@@ -1996,7 +2070,7 @@ function SaldosScreen({ ops, onClient, onMarkClient }) {
 // ═══════════════════════════════════════════════════════════════════
 //  SHEET · DETALLE SALDO CLIENTE
 // ═══════════════════════════════════════════════════════════════════
-function SaldoClienteSheet({ clientName, ops, onClose, onDetail, onMarkClient, onToggleOp, notify }) {
+function SaldoClienteSheet({ clientName, ops, onClose, onDetail, onMarkClient, onToggleOp, onMerge, notify }) {
   const balances = useMemo(() => calcClientBalances(ops), [ops]);
   const cb = balances.find(b => b.client === clientName);
 
@@ -2004,6 +2078,11 @@ function SaldoClienteSheet({ clientName, ops, onClose, onDetail, onMarkClient, o
   const [editingNote, setEditingNote] = useState(false);
   const [noteText, setNoteText] = useState(notes[clientName] || "");
   const [confirmOp, setConfirmOp] = useState(null);
+  const [mergeMode, setMergeMode] = useState(false);
+  const [mergeSel, setMergeSel] = useState(new Set());
+  const [mergeConfirm, setMergeConfirm] = useState(null); // { ids, bankConflict, exchConflict, banks, exchs }
+  const [pickBank, setPickBank] = useState("");
+  const [pickExch, setPickExch] = useState("");
   const opPressTimer = useRef(null);
   const startOpPress = (opId) => { opPressTimer.current = setTimeout(() => setConfirmOp(opId), 550); };
   const cancelOpPress = () => { if (opPressTimer.current) clearTimeout(opPressTimer.current); };
@@ -2083,14 +2162,22 @@ function SaldoClienteSheet({ clientName, ops, onClose, onDetail, onMarkClient, o
           </div>
         ) : (
           notes[clientName]
-            ? <div style={{ fontSize: 14, color: C.soft, lineHeight: 1.5 }}>{notes[clientName]}</div>
+            ? <div style={{ fontSize: 14, color: C.soft, lineHeight: 1.5, whiteSpace: "pre-wrap" }}>{notes[clientName]}</div>
             : <div style={{ fontSize: 13, color: C.muted, fontStyle: "italic" }}>Sin nota</div>
         )}
       </div>
 
-      <div style={{ fontSize: 10, color: C.muted, textTransform: "uppercase", letterSpacing: "0.18em", fontWeight: 700, marginBottom: 10, display: "flex", justifyContent: "space-between" }}>
+      <div style={{ fontSize: 10, color: C.muted, textTransform: "uppercase", letterSpacing: "0.18em", fontWeight: 700, marginBottom: 10, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <span>Desglose</span>
-        <span>{cb.ops.length} ops</span>
+        {cb.ops.length >= 2 ? (
+          <button onClick={() => { setMergeMode(m => !m); setMergeSel(new Set()); }} style={{
+            fontSize: 10, fontWeight: 800, letterSpacing: "0.1em", textTransform: "uppercase",
+            padding: "5px 10px", borderRadius: 7, fontFamily: "inherit",
+            background: mergeMode ? C.accent : C.accentDim,
+            border: `1px solid ${mergeMode ? C.accent : C.accent + "44"}`,
+            color: mergeMode ? C.bg : C.accent,
+          }}>{mergeMode ? "Cancelar" : "Fusionar"}</button>
+        ) : <span>{cb.ops.length} ops</span>}
       </div>
 
       <div style={{
@@ -2105,26 +2192,37 @@ function SaldoClienteSheet({ clientName, ops, onClose, onDetail, onMarkClient, o
       </div>
 
       <div style={{ fontSize: 9, color: C.muted, marginBottom: 10, fontStyle: "italic" }}>
-        Tocá para abrir · Mantené presionado para marcar saldada
+        {mergeMode ? "Tocá las operaciones a fusionar (2 o más)" : "Tocá para abrir · Mantené presionado para marcar saldada"}
       </div>
 
       <div style={{ marginBottom: 8 }}>
         {cb.ops.map((op, i) => {
           const t = T[op.type] || T.venta;
           const opColor = op.favor === "me" ? C.negative : C.accent2;
+          const isMergeSel = mergeSel.has(op.id);
+          const rowClick = () => {
+            if (mergeMode) {
+              setMergeSel(s => { const n = new Set(s); n.has(op.id) ? n.delete(op.id) : n.add(op.id); return n; });
+            } else { onDetail(op.id); }
+          };
           return (
             <button key={op.id}
-              onClick={() => onDetail(op.id)}
-              onTouchStart={() => startOpPress(op.id)}
+              onClick={rowClick}
+              onTouchStart={() => { if (!mergeMode) startOpPress(op.id); }}
               onTouchEnd={cancelOpPress}
               onTouchMove={cancelOpPress}
-              onContextMenu={e => { e.preventDefault(); setConfirmOp(op.id); }}
+              onContextMenu={e => { e.preventDefault(); if (!mergeMode) setConfirmOp(op.id); }}
               style={{
-                display: "grid", gridTemplateColumns: "52px 1fr 70px 1fr",
-                width: "100%", padding: "14px 10px", alignItems: "center", textAlign: "left",
+                display: "grid", gridTemplateColumns: mergeMode ? "26px 46px 1fr 64px 1fr" : "52px 1fr 70px 1fr",
+                width: "100%", padding: "14px 10px", alignItems: "center", textAlign: "left", gap: 4,
                 borderBottom: i < cb.ops.length - 1 ? `1px solid ${C.border}` : "none",
-                background: "transparent", transition: `background 0.2s ${EASE}`,
+                background: isMergeSel ? C.accentDim : "transparent", transition: `background 0.2s ${EASE}`,
               }}>
+              {mergeMode && (
+                <div style={{ width: 18, height: 18, borderRadius: 4, border: `1.5px solid ${isMergeSel ? C.accent : C.border}`, background: isMergeSel ? C.accent : "transparent", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  {isMergeSel && <Check size={11} color={C.bg} strokeWidth={3} />}
+                </div>
+              )}
               <div>
                 <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13, fontWeight: 700, color: C.text }}>{op.date.slice(0, 5)}</div>
                 <div style={{ fontSize: 8, color: t.primary, fontWeight: 800, letterSpacing: "0.1em", marginTop: 3 }}>{t.label}</div>
@@ -2143,6 +2241,75 @@ function SaldoClienteSheet({ clientName, ops, onClose, onDetail, onMarkClient, o
           );
         })}
       </div>
+
+      {mergeMode && mergeSel.size >= 2 && (
+        <button onClick={() => {
+          const ids = [...mergeSel];
+          const full = ops.filter(o => ids.includes(o.id));
+          const banks = [...new Set(full.map(o => o.bank || ""))];
+          const exchs = [...new Set(full.map(o => o.exchange || ""))];
+          const bankConflict = banks.length > 1;
+          const exchConflict = exchs.length > 1;
+          setPickBank(banks[0] || "");
+          setPickExch(exchs[0] || "");
+          setMergeConfirm({ ids, bankConflict, exchConflict, banks, exchs });
+        }} style={{
+          width: "100%", padding: 14, borderRadius: 12, marginBottom: 12,
+          background: `linear-gradient(135deg, ${C.accent}, ${C.accent2}cc)`, color: C.bg,
+          fontSize: 12, fontWeight: 800, letterSpacing: "0.12em", textTransform: "uppercase", fontFamily: "inherit",
+          display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+        }}>
+          <ArrowLeftRight size={15} /> Fusionar {mergeSel.size} operaciones
+        </button>
+      )}
+
+      {mergeConfirm && (
+        <>
+          <div onClick={() => setMergeConfirm(null)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.8)", zIndex: 300, backdropFilter: "blur(6px)", animation: "fadeIn 0.2s ease" }} />
+          <div style={{
+            position: "fixed", left: "50%", top: "50%", transform: "translate(-50%, -50%)",
+            zIndex: 301, width: "88%", maxWidth: 380,
+            background: "rgba(12,7,20,0.99)", border: `1px solid ${C.borderStrong}`,
+            borderRadius: 20, padding: "22px 20px", animation: "fadeUp 0.25s ease",
+          }}>
+            <div style={{ fontSize: 17, fontWeight: 800, color: C.text, marginBottom: 8 }}>Fusionar {mergeConfirm.ids.length} operaciones</div>
+            <div style={{ fontSize: 12, color: C.soft, lineHeight: 1.5, marginBottom: 16 }}>
+              Se crea una operación con USDT sumado y TC promedio ponderado. Las TTs se unen (cada una conserva su banco). Las originales se eliminan.
+            </div>
+            {(mergeConfirm.bankConflict || mergeConfirm.exchConflict) && (
+              <div style={{ background: C.warnDim, border: `1px solid ${C.warn}44`, borderRadius: 10, padding: "10px 12px", marginBottom: 14 }}>
+                <div style={{ fontSize: 11, color: C.warn, fontWeight: 700, marginBottom: 8 }}>
+                  ⚠ No coinciden {mergeConfirm.bankConflict && mergeConfirm.exchConflict ? "bancos ni exchange" : mergeConfirm.bankConflict ? "los bancos" : "los exchange"} — elegí o dejá en blanco
+                </div>
+                {mergeConfirm.bankConflict && (
+                  <select value={pickBank} onChange={e => setPickBank(e.target.value)}
+                    style={{ width: "100%", padding: "8px 10px", borderRadius: 8, background: "rgba(0,0,0,0.4)", border: `1px solid ${C.border}`, color: C.text, fontSize: 13, marginBottom: 8 }}>
+                    <option value="">Banco — completar manualmente</option>
+                    {mergeConfirm.banks.filter(Boolean).map(b => <option key={b} value={b}>{b}</option>)}
+                  </select>
+                )}
+                {mergeConfirm.exchConflict && (
+                  <select value={pickExch} onChange={e => setPickExch(e.target.value)}
+                    style={{ width: "100%", padding: "8px 10px", borderRadius: 8, background: "rgba(0,0,0,0.4)", border: `1px solid ${C.border}`, color: C.text, fontSize: 13 }}>
+                    <option value="">Exchange — completar manualmente</option>
+                    {mergeConfirm.exchs.filter(Boolean).map(x => <option key={x} value={x}>{x}</option>)}
+                  </select>
+                )}
+              </div>
+            )}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <button onClick={() => setMergeConfirm(null)} style={{ padding: 12, borderRadius: 11, border: `1px solid ${C.border}`, color: C.soft, fontSize: 12, fontWeight: 700, fontFamily: "inherit", textTransform: "uppercase", letterSpacing: "0.1em" }}>Cancelar</button>
+              <button onClick={() => {
+                const ov = {};
+                if (mergeConfirm.bankConflict) ov.bank = pickBank;
+                if (mergeConfirm.exchConflict) ov.exchange = pickExch;
+                onMerge(mergeConfirm.ids, ov);
+                setMergeConfirm(null);
+              }} style={{ padding: 12, borderRadius: 11, background: C.accent, color: C.bg, fontSize: 12, fontWeight: 800, fontFamily: "inherit", textTransform: "uppercase", letterSpacing: "0.1em" }}>Fusionar</button>
+            </div>
+          </div>
+        </>
+      )}
 
       {confirmOp && (() => {
         const op = cb.ops.find(o => o.id === confirmOp);
@@ -2817,6 +2984,7 @@ function TTsList({ op, sent, onDelTT, onUpdate, notify }) {
   const [editingTT, setEditingTT] = useState(null);
   const [editDate, setEditDate] = useState("");
   const [editAmount, setEditAmount] = useState("");
+  const [editBank, setEditBank] = useState("");
   const [bulkDate, setBulkDate] = useState("");
   const [showBulk, setShowBulk] = useState(false);
   const [ttSearch, setTtSearch] = useState("");
@@ -2839,6 +3007,7 @@ function TTsList({ op, sent, onDelTT, onUpdate, notify }) {
     setEditingTT(tt.id);
     setEditDate(tt.date || op.date);
     setEditAmount(String(tt.amount));
+    setEditBank(tt.bank || op.bank || "");
   };
 
   const saveEdit = () => {
@@ -2847,7 +3016,7 @@ function TTsList({ op, sent, onDelTT, onUpdate, notify }) {
     const newDate = `${m[1].padStart(2,"0")}/${m[2].padStart(2,"0")}/${m[3]}`;
     const newAmount = parseNum(editAmount);
     if (newAmount < 1) { notify("Monto inválido", { kind: "error" }); return; }
-    const newTTs = op.tts.map(t => t.id === editingTT ? { ...t, date: newDate, amount: newAmount } : t);
+    const newTTs = op.tts.map(t => t.id === editingTT ? { ...t, date: newDate, amount: newAmount, bank: editBank || undefined } : t);
     onUpdate(op.id, { tts: newTTs });
     notify("✓ TT actualizada");
     setEditingTT(null);
@@ -2932,6 +3101,11 @@ function TTsList({ op, sent, onDelTT, onUpdate, notify }) {
                     <input value={editAmount} onChange={e => setEditAmount(e.target.value)} placeholder="Monto" inputMode="decimal"
                       style={{ flex: 1, padding: "7px 10px", borderRadius: 7, background: "rgba(0,0,0,0.4)", border: `1px solid ${C.accent}66`, color: C.text, fontSize: 12, fontFamily: "'JetBrains Mono', monospace" }} />
                   </div>
+                  <select value={editBank} onChange={e => setEditBank(e.target.value)}
+                    style={{ width: "100%", padding: "7px 10px", borderRadius: 7, background: "rgba(0,0,0,0.4)", border: `1px solid ${C.accent}66`, color: C.text, fontSize: 12 }}>
+                    <option value="">Banco (default: {op.bank || "—"})</option>
+                    {BANKS.map(b => <option key={b.id} value={b.id}>{b.id}</option>)}
+                  </select>
                   <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
                     <button onClick={() => setEditingTT(null)} style={{ padding: "6px 10px", borderRadius: 7, color: C.muted, fontSize: 11, fontFamily: "inherit" }}>Cancelar</button>
                     <button onClick={saveEdit} style={{ padding: "6px 10px", borderRadius: 7, background: C.positive, color: C.bg, fontSize: 11, fontWeight: 700, fontFamily: "inherit" }}>Guardar</button>
@@ -2945,6 +3119,7 @@ function TTsList({ op, sent, onDelTT, onUpdate, notify }) {
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontSize: 11, color: C.muted, fontFamily: "'JetBrains Mono', monospace" }}>
                       TT {String(i + 1).padStart(2, "0")}{dateDiffers && <span style={{ color: C.accent2, marginLeft: 6 }}>· {ttDate}</span>}
+                      <span style={{ color: tt.bank && tt.bank !== op.bank ? C.accent : C.muted, marginLeft: 6, opacity: tt.bank ? 1 : 0.6 }}>· {tt.bank || op.bank || "—"}</span>
                     </div>
                     <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 14, color: C.text, fontWeight: 600 }}>{fmtARS(tt.amount)}</div>
                   </div>
@@ -3386,6 +3561,9 @@ function SettingsSheet({ ops, prefs, onClose, onImport, notify }) {
   const [driveStatus, setDriveStatus] = useState({ connected: driveSync.isConnected(), needsReconnect: driveSync.getNeedsReconnect(), lastSync: driveSync.getLastSync() });
   const alasiaMonths = useMemo(() => availableMonths(ops), [ops]);
   const [alasiaMonth, setAlasiaMonth] = useState(alasiaMonths[0] || todayStr().slice(3));
+  const [genNotes, setGenNotes] = useState(loadGeneralNotes());
+  const [genDirty, setGenDirty] = useState(false);
+  const saveGen = () => { saveGeneralNotes(genNotes); setGenDirty(false); notify("✓ Notas guardadas"); };
   const doAlasiaExport = () => {
     const ok = exportAlasiaXLSX(ops, alasiaMonth);
     if (ok) notify(`✓ Excel ${alasiaMonth} descargado`);
@@ -3455,6 +3633,24 @@ function SettingsSheet({ ops, prefs, onClose, onImport, notify }) {
   return (
     <Sheet title="Más" subtitle="Drive, backup, info" onClose={onClose}>
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        <div style={{ background: C.accentDim, border: `1px solid ${C.accent}33`, borderRadius: 14, padding: "14px 16px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <ScrollText size={16} color={C.accent} />
+              <span style={{ fontSize: 13, fontWeight: 700, color: C.text }}>Notas generales</span>
+            </div>
+            {genDirty && (
+              <button onClick={saveGen} style={{ padding: "6px 14px", borderRadius: 8, background: C.accent, color: C.bg, fontSize: 11, fontWeight: 800, fontFamily: "inherit", letterSpacing: "0.08em", textTransform: "uppercase" }}>Guardar</button>
+            )}
+          </div>
+          <textarea value={genNotes}
+            onChange={e => { setGenNotes(e.target.value); setGenDirty(true); }}
+            onBlur={() => { if (genDirty) saveGen(); }}
+            placeholder="Cosas del mes para recordar…"
+            rows={5}
+            style={{ width: "100%", padding: "11px 13px", borderRadius: 10, background: "rgba(0,0,0,0.4)", border: `1px solid ${C.border}`, color: C.text, fontSize: 14, resize: "vertical", fontFamily: "inherit", whiteSpace: "pre-wrap", lineHeight: 1.5 }} />
+        </div>
+
         <div style={{
           background: needsReconnect ? C.warnDim : driveStatus.connected ? C.positiveDim : C.accentDim,
           border: `1px solid ${needsReconnect ? C.warn + "66" : driveStatus.connected ? C.positiveBorder : C.accent + "44"}`,
